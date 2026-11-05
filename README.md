@@ -82,6 +82,10 @@ The goal is to demonstrate a production-style approach to making data pipelines 
 │   └── plugins/               # Custom operators and helper hooks
 ├── config/                    # Database connections, logging, and alert rules
 ├── data/                      # Sample input data and mock datasets
+│   ├── batches/                  # Six transaction fixture batches (generated)
+│   ├── reference/                # accounts.csv — 500 reference accounts
+│   ├── expected/                 # manifest.json — expected outcome per batch
+│   └── genration_script/         # Deterministic data generator (stdlib only)
 ├── scripts/                   # Setup, migration, and maintenance scripts
 ├── src/
 │   ├── extract/               # Data ingestion modules

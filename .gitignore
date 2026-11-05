@@ -1,1 +1,5 @@
 .venv/*
+data/*
+!data/genration_script
+__pycache__/
+*.pyc
