@@ -1,0 +1,436 @@
+[
+    {
+        "file_name": "transactions_clean_1000.csv",
+        "file_path": "data\\batches\\transactions_clean_1000.csv",
+        "row_count": 1000,
+        "column_count": 8,
+        "raw_columns_order": [
+            "transaction_id",
+            "account_id",
+            "txn_type",
+            "amount",
+            "currency",
+            "txn_date",
+            "channel",
+            "status"
+        ],
+        "data_types": {
+            "transaction_id": "string",
+            "account_id": "string",
+            "txn_type": "string",
+            "amount": "string",
+            "currency": "string",
+            "txn_date": "string",
+            "channel": "string",
+            "status": "string"
+        },
+        "null_counts_per_column": {
+            "transaction_id": 0,
+            "account_id": 5,
+            "txn_type": 4,
+            "amount": 0,
+            "currency": 0,
+            "txn_date": 3,
+            "channel": 0,
+            "status": 0
+        },
+        "total_nulls_count": 12,
+        "duplicated_rows_count": 0,
+        "data_ranges": {
+            "transaction_id": {
+                "min": "TXN00000001",
+                "max": "TXN00000990"
+            },
+            "account_id": {
+                "min": "ACC000002",
+                "max": "ACC972130"
+            },
+            "txn_type": {
+                "min": "DEPOSIT",
+                "max": "WITHDRAWAL"
+            },
+            "amount": {
+                "min": "-4215.54",
+                "max": "ten dollars"
+            },
+            "currency": {
+                "min": "EGP",
+                "max": "USD"
+            },
+            "txn_date": {
+                "min": "1990-11-23",
+                "max": "not-a-date"
+            },
+            "channel": {
+                "min": "ATM",
+                "max": "POS"
+            },
+            "status": {
+                "min": "PENDING",
+                "max": "SETTLED"
+            }
+        }
+    },
+    {
+        "file_name": "transactions_empty.csv",
+        "file_path": "data\\batches\\transactions_empty.csv",
+        "row_count": 0,
+        "column_count": 8,
+        "raw_columns_order": [
+            "transaction_id",
+            "account_id",
+            "txn_type",
+            "amount",
+            "currency",
+            "txn_date",
+            "channel",
+            "status"
+        ],
+        "data_types": {
+            "transaction_id": "empty",
+            "account_id": "empty",
+            "txn_type": "empty",
+            "amount": "empty",
+            "currency": "empty",
+            "txn_date": "empty",
+            "channel": "empty",
+            "status": "empty"
+        },
+        "null_counts_per_column": {
+            "transaction_id": 0,
+            "account_id": 0,
+            "txn_type": 0,
+            "amount": 0,
+            "currency": 0,
+            "txn_date": 0,
+            "channel": 0,
+            "status": 0
+        },
+        "total_nulls_count": 0,
+        "duplicated_rows_count": 0,
+        "data_ranges": {
+            "transaction_id": {
+                "min": null,
+                "max": null
+            },
+            "account_id": {
+                "min": null,
+                "max": null
+            },
+            "txn_type": {
+                "min": null,
+                "max": null
+            },
+            "amount": {
+                "min": null,
+                "max": null
+            },
+            "currency": {
+                "min": null,
+                "max": null
+            },
+            "txn_date": {
+                "min": null,
+                "max": null
+            },
+            "channel": {
+                "min": null,
+                "max": null
+            },
+            "status": {
+                "min": null,
+                "max": null
+            }
+        }
+    },
+    {
+        "file_name": "transactions_high_rejection.csv",
+        "file_path": "data\\batches\\transactions_high_rejection.csv",
+        "row_count": 1000,
+        "column_count": 8,
+        "raw_columns_order": [
+            "transaction_id",
+            "account_id",
+            "txn_type",
+            "amount",
+            "currency",
+            "txn_date",
+            "channel",
+            "status"
+        ],
+        "data_types": {
+            "transaction_id": "string",
+            "account_id": "string",
+            "txn_type": "string",
+            "amount": "string",
+            "currency": "string",
+            "txn_date": "string",
+            "channel": "string",
+            "status": "string"
+        },
+        "null_counts_per_column": {
+            "transaction_id": 0,
+            "account_id": 10,
+            "txn_type": 11,
+            "amount": 11,
+            "currency": 0,
+            "txn_date": 4,
+            "channel": 0,
+            "status": 0
+        },
+        "total_nulls_count": 36,
+        "duplicated_rows_count": 0,
+        "data_ranges": {
+            "transaction_id": {
+                "min": "TXN00100000",
+                "max": "TXN00100969"
+            },
+            "account_id": {
+                "min": "ACC000001",
+                "max": "ACC993338"
+            },
+            "txn_type": {
+                "min": "DEPOSIT",
+                "max": "WITHDRAWAL"
+            },
+            "amount": {
+                "min": "-1909.22",
+                "max": "ten dollars"
+            },
+            "currency": {
+                "min": "EGP",
+                "max": "USD"
+            },
+            "txn_date": {
+                "min": "1995-05-10",
+                "max": "not-a-date"
+            },
+            "channel": {
+                "min": "ATM",
+                "max": "POS"
+            },
+            "status": {
+                "min": "PENDING",
+                "max": "SETTLED"
+            }
+        }
+    },
+    {
+        "file_name": "transactions_schema_corrupt.csv",
+        "file_path": "data\\batches\\transactions_schema_corrupt.csv",
+        "row_count": 1000,
+        "column_count": 7,
+        "raw_columns_order": [
+            "transaction_id",
+            "acct_no",
+            "txn_date",
+            "txn_type",
+            "currency",
+            "channel",
+            "status"
+        ],
+        "data_types": {
+            "transaction_id": "string",
+            "acct_no": "string",
+            "txn_date": "string",
+            "txn_type": "string",
+            "currency": "string",
+            "channel": "string",
+            "status": "string"
+        },
+        "null_counts_per_column": {
+            "transaction_id": 0,
+            "acct_no": 4,
+            "txn_date": 0,
+            "txn_type": 2,
+            "currency": 0,
+            "channel": 0,
+            "status": 0
+        },
+        "total_nulls_count": 6,
+        "duplicated_rows_count": 0,
+        "data_ranges": {
+            "transaction_id": {
+                "min": "TXN00200000",
+                "max": "TXN00200989"
+            },
+            "acct_no": {
+                "min": "ACC000001",
+                "max": "ACC993967"
+            },
+            "txn_date": {
+                "min": "1993-09-10",
+                "max": "31/13/2025"
+            },
+            "txn_type": {
+                "min": "DEPOSIT",
+                "max": "WITHDRAWAL"
+            },
+            "currency": {
+                "min": "EGP",
+                "max": "USD"
+            },
+            "channel": {
+                "min": "ATM",
+                "max": "POS"
+            },
+            "status": {
+                "min": "PENDING",
+                "max": "SETTLED"
+            }
+        }
+    },
+    {
+        "file_name": "transactions_schema_corrupt_fixed.csv",
+        "file_path": "data\\batches\\transactions_schema_corrupt_fixed.csv",
+        "row_count": 1000,
+        "column_count": 8,
+        "raw_columns_order": [
+            "transaction_id",
+            "account_id",
+            "txn_type",
+            "amount",
+            "currency",
+            "txn_date",
+            "channel",
+            "status"
+        ],
+        "data_types": {
+            "transaction_id": "string",
+            "account_id": "string",
+            "txn_type": "string",
+            "amount": "string",
+            "currency": "string",
+            "txn_date": "string",
+            "channel": "string",
+            "status": "string"
+        },
+        "null_counts_per_column": {
+            "transaction_id": 0,
+            "account_id": 4,
+            "txn_type": 2,
+            "amount": 6,
+            "currency": 0,
+            "txn_date": 0,
+            "channel": 0,
+            "status": 0
+        },
+        "total_nulls_count": 12,
+        "duplicated_rows_count": 0,
+        "data_ranges": {
+            "transaction_id": {
+                "min": "TXN00200000",
+                "max": "TXN00200989"
+            },
+            "account_id": {
+                "min": "ACC000001",
+                "max": "ACC993967"
+            },
+            "txn_type": {
+                "min": "DEPOSIT",
+                "max": "WITHDRAWAL"
+            },
+            "amount": {
+                "min": "-1298.82",
+                "max": "abc"
+            },
+            "currency": {
+                "min": "EGP",
+                "max": "USD"
+            },
+            "txn_date": {
+                "min": "1993-09-10",
+                "max": "31/13/2025"
+            },
+            "channel": {
+                "min": "ATM",
+                "max": "POS"
+            },
+            "status": {
+                "min": "PENDING",
+                "max": "SETTLED"
+            }
+        }
+    },
+    {
+        "file_name": "transactions_unreadable.csv",
+        "file_path": "data\\batches\\transactions_unreadable.csv",
+        "row_count": 14,
+        "column_count": 1,
+        "raw_columns_order": [
+            "�N\u0017\"�W>{��\f\b�a��C@��ӎVI�z��W>\u001b\u001d�����̅�\u0002A*\\Y�O�$��\u0001R?�qi��M�!]U�\u0007z����l����r�e\u0007�."
+        ],
+        "data_types": {
+            "�N\u0017\"�W>{��\f\b�a��C@��ӎVI�z��W>\u001b\u001d�����̅�\u0002A*\\Y�O�$��\u0001R?�qi��M�!]U�\u0007z����l����r�e\u0007�.": "string"
+        },
+        "null_counts_per_column": {
+            "�N\u0017\"�W>{��\f\b�a��C@��ӎVI�z��W>\u001b\u001d�����̅�\u0002A*\\Y�O�$��\u0001R?�qi��M�!]U�\u0007z����l����r�e\u0007�.": 0
+        },
+        "total_nulls_count": 0,
+        "duplicated_rows_count": 0,
+        "data_ranges": {
+            "�N\u0017\"�W>{��\f\b�a��C@��ӎVI�z��W>\u001b\u001d�����̅�\u0002A*\\Y�O�$��\u0001R?�qi��M�!]U�\u0007z����l����r�e\u0007�.": {
+                "min": "-�|OV�\u0014&�\u0005%�(����\u0000\u0015��}\\L]�E\u0011eF��#�ݲ\u0011\u000e��Dgj!�wQ��\u0004�\u0019[+g���r@F+�",
+                "max": "��t�w\u0001�\u0012q|����8�{P��O�2�3���\tq�\u001a\u001c��\u0012q\u001b���l�"
+            }
+        }
+    },
+    {
+        "file_name": "accounts.csv",
+        "file_path": "data\\reference\\accounts.csv",
+        "row_count": 500,
+        "column_count": 6,
+        "raw_columns_order": [
+            "account_id",
+            "customer_name",
+            "account_type",
+            "branch",
+            "open_date",
+            "status"
+        ],
+        "data_types": {
+            "account_id": "string",
+            "customer_name": "string",
+            "account_type": "string",
+            "branch": "string",
+            "open_date": "datetime",
+            "status": "string"
+        },
+        "null_counts_per_column": {
+            "account_id": 0,
+            "customer_name": 0,
+            "account_type": 0,
+            "branch": 0,
+            "open_date": 0,
+            "status": 0
+        },
+        "total_nulls_count": 0,
+        "duplicated_rows_count": 0,
+        "data_ranges": {
+            "account_id": {
+                "min": "ACC000001",
+                "max": "ACC000500"
+            },
+            "customer_name": {
+                "min": "Ahmed Adel",
+                "max": "Youssef Samir"
+            },
+            "account_type": {
+                "min": "BUSINESS",
+                "max": "SAVINGS"
+            },
+            "branch": {
+                "min": "ALEX-02",
+                "max": "TANTA-04"
+            },
+            "open_date": {
+                "min": "2015-01-05",
+                "max": "2022-12-23"
+            },
+            "status": {
+                "min": "ACTIVE",
+                "max": "CLOSED"
+            }
+        }
+    }
+]
