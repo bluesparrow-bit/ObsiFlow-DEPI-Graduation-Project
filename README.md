@@ -1,9 +1,9 @@
-# Data Quality & Pipeline Observability Platform
+# ObsiFlow: Data Quality & Pipeline Observability Platform
 
 <div align="center">
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![Apache Airflow](https://img.shields.io/badge/Apache%2520Airflow-017CEE?style=for-the-badge&logo=Apache%20Airflow&logoColor=white)](https://airflow.apache.org/)
+[![Apache Airflow](https://img.shields.io/badge/Apache%20Airflow-017CEE?style=for-the-badge&logo=Apache%20Airflow&logoColor=white)](https://airflow.apache.org/)
 [![Pandas](https://img.shields.io/badge/Pandas-150458?style=for-the-badge&logo=pandas&logoColor=white)](https://pandas.pydata.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?style=for-the-badge&logo=prometheus&logoColor=white)](https://prometheus.io/)
@@ -13,87 +13,146 @@
 
 </div>
 
-A production-oriented ETL framework that detects data-quality issues early, records failures, exposes operational metrics, and provides monitoring & alerting so problems are caught before they reach business dashboards.
+A production-grade ETL and observability platform that validates data before loading, isolates defective records, exposes comprehensive operational telemetry via Prometheus, and provides proactive alerting in Grafana.
 
 ---
 
-## Team
+## Table of Contents
 
-Name | Role/s | Abbreviation/s|
------|--------|---------------|
-Mohammad Maher Metwaly | Data Quality Engineer, DevOps Engineer (Team Leader) | DQ - DO
-Hager Abedlnasser Seddiq | DevOps Engineer, Data Quality Engineer | DO - DQ
-Elhussieny Sabry Elshahat | Data Reliability /Test Engineer, Data Platform / Orchestration Engineer | QA - OR
-Sara Ahmed Abdelhamid | Data Platform / Orchestration Engineer, Data Reliability /Test Engineer | OR - QA
-Soltan Akram Soltan | Data Pipeline Engineer | DE
-Malak Magdy Mohamed | Observability Engineer | OB
+- [Project Status](#project-status)
+- [Problem Statement](#problem-statement)
+- [Key Capabilities](#key-capabilities)
+- [Architecture & Data Flow](#architecture--data-flow)
+- [Technology Stack](#technology-stack)
+- [Repository Structure](#repository-structure)
+- [Documentation Links](#documentation-links)
+- [Team Members & Roles](#team-members--roles)
 
 ---
 
-## Project Overview
+## Project Status
 
-Many companies run automated data pipelines, yet failures and bad data are often discovered only after business users report incorrect dashboards.
+**Current Phase**: Active Development — Foundation, Test Data Generation & Governance (Week 1–2).  
+Core baseline specifications, data generators, documentation structure, and contribution governance are established. Implementation of pipeline modules, Airflow orchestration, and Prometheus telemetry is underway.
 
-This project builds a **representative ETL pipeline** enhanced with:
+---
 
-- **Data-quality checks** (nulls, duplicates, schema/type validation, row counts, referential integrity, range checks)
-- **Pipeline reliability** (exception handling, retries, failed-task handling, dead-letter / error records, structured logging)
-- **Observability** (pipeline duration, success/failure counts, records processed vs rejected, data-quality failure metrics)
-- **Monitoring & Alerting** (Prometheus metrics + Grafana dashboards + alerts for failed or abnormal runs)
+## Problem Statement
 
-The goal is to demonstrate a production-style approach to making data pipelines trustworthy and observable.
+Many organizations operate automated data pipelines where data corruption, schema drift, and silent ingestion failures are only detected downstream when business stakeholders report incorrect dashboards. By that time, damaged data has propagated, causing costly backfills and manual root-cause investigations.
+
+ObsiFlow solves this by implementing pre-load validation gates, quarantining defective rows into a dead-letter store, enforcing idempotent re-runs, and capturing real-time pipeline telemetry to detect anomalies before data reaches production tables.
+
+---
+
+## Key Capabilities
+
+- **Six Data Quality Rule Families**: Validates nulls, duplicates, schema/data types, row counts, referential integrity, and range bounds.
+- **Dead-Letter Quarantine**: Routes invalid records to a quarantine store with failure reasons, batch IDs, and audit timestamps.
+- **Idempotent Loading**: Guarantees safe batch re-runs in PostgreSQL without duplicating records.
+- **Airflow Orchestration**: Robust task execution with automated retries for transient issues and explicit failure reporting.
+- **Operational Logging**: Persists comprehensive execution metadata (`run_id`, duration, extracted/loaded/rejected counts).
+- **Proactive Observability**: Prometheus metrics export and Grafana dashboards tracking health, latency, and four alert scenarios (stale, failed, never-reported, and high-rejection runs).
 
 ---
 
 ## Architecture & Data Flow
 
-**High-level flow:**
-1. Extract data from source files / database
-2. Run comprehensive data-quality validations
-3. Route invalid records to an error / dead-letter store
-4. Transform clean data and load into the target database
-5. Emit metrics (records processed, rejected, duration, DQ failures, pipeline status)
-6. Airflow orchestrates the full Extract → Validate → Transform → Load → Quality Check sequence with retries and logging
-7. Prometheus scrapes metrics; Grafana visualizes them and triggers alerts on failures or anomalies
+```text
+[ Source Files / Batches ]
+           │
+           ▼
+[ 1. Ingestion / Extract ]
+           │
+           ▼
+[ 2. Data Quality Engine ] ──── (Invalid Records) ───► [ Quarantine / Dead-Letter Store ]
+           │
+     (Valid Records)
+           │
+           ▼
+[ 3. Transformation ]
+           │
+           ▼
+[ 4. Target Database Loading ] (Idempotent Upsert)
+           │
+           ▼
+[ 5. Execution Logging & Metrics ] ───► [ PostgreSQL Logs ] + [ Prometheus Metrics ]
+                                                                     │
+                                                                     ▼
+                                                              [ Grafana Dashboard & Alerts ]
+```
 
 ---
 
 ## Technology Stack
 
-| Layer              | Technology                          |
-|--------------------|-------------------------------------|
-| Language           | Python 3.10+                        |
-| Orchestration      | Apache Airflow                      |
-| Data Processing    | Pandas                              |
-| Database           | PostgreSQL                          |
-| Metrics            | Prometheus                          |
-| Visualization      | Grafana                             |
-| Containerization   | Docker & Docker Compose             |
-| CI/CD              | GitHub Actions                      |
-| Logging            | Python `logging` + structured logs  |
+| Layer | Technology | Purpose |
+|---|---|---|
+| **Language** | Python 3.10+ | Core ETL modules and data validation logic |
+| **Orchestration** | Apache Airflow | Workflow scheduling, task dependency, and retry policies |
+| **Data Processing** | Pandas | Ingestion, cleaning, transformation, and validation rules |
+| **Database** | PostgreSQL | Target warehouse and pipeline execution audit logs |
+| **Metrics** | Prometheus | Scrapes and stores operational telemetry and DQ counters |
+| **Visualization & Alerting** | Grafana | Dashboards for pipeline health, run latency, and alerts |
+| **Containerization** | Docker & Docker Compose | Multi-container local execution environment |
+| **Version Control** | Git & GitHub | Source control, collaborative code reviews, and governance |
 
 ---
 
 ## Repository Structure
 
 ```text
-├── airflow/
-│   ├── dags/                  # Airflow DAG definitions for pipeline orchestration
-│   └── plugins/               # Custom operators and helper hooks
-├── config/                    # Database connections, logging, and alert rules
-├── data/                      # Sample input data and mock datasets
-│   ├── batches/                  # Six transaction fixture batches (generated)
-│   ├── reference/                # accounts.csv — 500 reference accounts
-│   ├── expected/                 # manifest.json — expected outcome per batch
-│   └── genration_script/         # Deterministic data generator (stdlib only)
-├── scripts/                   # Setup, migration, and maintenance scripts
-├── src/
-│   ├── extract/               # Data ingestion modules
-│   ├── transform/             # Cleaning, formatting, and business logic
-│   ├── validate/              # Data quality rules and schema checking
-│   └── load/                  # Database loading and dead-letter routing
-├── tests/                     # Unit and integration test suites
-├── docker-compose.yml         # Local container orchestration (Airflow, Postgres, Prometheus, Grafana)
-├── Dockerfile                 # Custom container build file
-├── requirements.txt           # Python dependencies
-└── README.md
+.
+├── .editorconfig              # Consistent multi-editor formatting standards
+├── .gitignore                 # Exclusion rules for environments, caches, and logs
+├── .github/                   # GitHub templates and community health files
+│   ├── ISSUE_TEMPLATE/        # Standardized issue templates (bug, feature, docs)
+│   │   ├── bug_report.md
+│   │   ├── feature_request.md
+│   │   ├── documentation.md
+│   │   └── config.yml
+│   └── PULL_REQUEST_TEMPLATE.md
+├── docs/                      # Central project documentation
+│   ├── README.md              # Documentation index
+│   ├── architecture/          # System design, data flow, and rule specifications
+│   ├── development/           # Setup, virtualenv, and test data generation guide
+│   └── operations/            # Prometheus metrics, Grafana dashboards, and alerting
+├── data/
+│   └── genration_script/      # Deterministic banking test-data generator (stdlib)
+│       ├── config.py
+│       └── generate_data.py
+├── requirements.txt           # Python package dependencies
+├── CONTRIBUTING.md            # Contribution guide, branch naming & commit rules
+├── CODE_OF_CONDUCT.md         # Team code of conduct and review etiquette
+├── SECURITY.md                # Security policy and vulnerability disclosure
+├── Data_Quality_Pipeline_Observability_Platform_Documentation.pdf # Full project proposal & plan
+└── README.md                  # Project overview (this file)
+```
+
+*Note: Component directories (`src/`, `airflow/`, `config/`, `scripts/`, `tests/`) will be populated in accordance with the 6-week project execution timeline.*
+
+---
+
+## Documentation Links
+
+- [Documentation Index](docs/README.md)
+- [System Architecture](docs/architecture/README.md)
+- [Development Setup Guide](docs/development/README.md)
+- [Operations & Telemetry](docs/operations/README.md)
+- [Contribution Guidelines](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security Policy](SECURITY.md)
+- [Baseline Project Plan & SRS (PDF)](Data_Quality_Pipeline_Observability_Platform_Documentation.pdf)
+
+---
+
+## Team Members & Roles
+
+| Member Name | Role Responsibilities | Abbreviation |
+|---|---|---|
+| **Mohammad Maher Metwaly** | Data Quality Engineer, DevOps Engineer (Team Leader) | `DQ` – `DO` |
+| **Hager Abedlnasser Seddiq** | DevOps Engineer, Data Quality Engineer | `DO` – `DQ` |
+| **Elhussieny Sabry Elshahat** | Data Reliability / Test Engineer, Platform / Orchestration Engineer | `QA` – `OR` |
+| **Sara Ahmed Abdelhamid** | Platform / Orchestration Engineer, Data Reliability / Test Engineer | `OR` – `QA` |
+| **Soltan Akram Soltan** | Data Pipeline Engineer | `DE` |
+| **Malak Magdy Mohamed** | Observability Engineer | `OB` |

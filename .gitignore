@@ -1,5 +1,117 @@
+# ==============================================================================
+# ObsiFlow Repository .gitignore
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Python & Bytecode
+# ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ------------------------------------------------------------------------------
+# Virtual Environments
+# ------------------------------------------------------------------------------
+.venv/
 .venv/*
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ------------------------------------------------------------------------------
+# Testing & Coverage
+# ------------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# ------------------------------------------------------------------------------
+# Build & Packaging
+# ------------------------------------------------------------------------------
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ------------------------------------------------------------------------------
+# Environment Variables & Secrets
+# ------------------------------------------------------------------------------
+# Do not commit real environment files or secrets
+.env
+.env.*
+*.env
+
+# Always track example environment templates
+!.env.example
+
+# ------------------------------------------------------------------------------
+# IDEs & Text Editors
+# ------------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+.directory
+
+# ------------------------------------------------------------------------------
+# Operating System Files
+# ------------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ------------------------------------------------------------------------------
+# Apache Airflow Local Artifacts & Logs
+# ------------------------------------------------------------------------------
+airflow/logs/
+airflow/airflow.db
+airflow/airflow.cfg
+airflow/webserver_config.py
+airflow/*.pid
+standalone_admin_password.txt
+
+# ------------------------------------------------------------------------------
+# Database Dumps & Local Data Storage
+# ------------------------------------------------------------------------------
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.sql.gz
+
+# ------------------------------------------------------------------------------
+# Project Generated Datasets
+# ------------------------------------------------------------------------------
+# Ignore generated batch fixtures while preserving the generation script
 data/*
 !data/genration_script
-__pycache__/
-*.pyc
+!data/genration_script/**
+data/genration_script/__pycache__/
+data/genration_script/*.py[cod]
+
