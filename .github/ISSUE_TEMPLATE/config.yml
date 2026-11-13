@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Team Technical Discussions
+    url: https://github.com/bluesparrow-bit/ObsiFlow-DEPI-Graduation-Project/discussions
+    about: Discuss architecture, design decisions, or ask questions before opening an issue.
+  - name: Project Specifications & Baseline Plan
+    url: https://github.com/bluesparrow-bit/ObsiFlow-DEPI-Graduation-Project/blob/main/Data_Quality_Pipeline_Observability_Platform_Documentation.pdf
+    about: Consult the full project plan, role deliverables, and KPI measurement framework.
