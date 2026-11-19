@@ -108,10 +108,22 @@ standalone_admin_password.txt
 # ------------------------------------------------------------------------------
 # Project Generated Datasets
 # ------------------------------------------------------------------------------
-# Ignore generated batch fixtures while preserving the generation script
+# Ignore generated batch fixtures while preserving committed samples and the generator
 data/*
 !data/genration_script
 !data/genration_script/**
+!data/sample_valid.csv
+!data/sample_corrupted.csv
+data/staging/
 data/genration_script/__pycache__/
 data/genration_script/*.py[cod]
+
+# ------------------------------------------------------------------------------
+# Airflow runtime (project-root layout)
+# ------------------------------------------------------------------------------
+logs/
+airflow-logs/
+airflow.cfg
+airflow.db
+standalone_admin_password.txt
 
