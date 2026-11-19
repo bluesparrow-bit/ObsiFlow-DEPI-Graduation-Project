@@ -1,0 +1,74 @@
+# ObsiFlow data-quality rule catalogue.
+#
+# This file is the single source of truth for thresholds.  It is validated by
+# config.settings.DQConfig at startup.  Change values here, not in rule modules.
+version: 1
+
+batch:
+  # A batch with fewer than 10 or more than 100,000 rows is failed closed.
+  min_rows: 10
+  max_rows: 100000
+  fail_on_row_count_violation: true
+  # Alerting threshold (fraction of extracted rows).  Exceeding it does not
+  # stop the load, but raises the HighRejectionRate Prometheus alert.
+  max_rejection_rate: 0.10
+  duplicate_key: transaction_id
+  duplicate_policy: keep_first
+
+schema:
+  required_columns:
+    - transaction_id
+    - account_id
+    - txn_type
+    - amount
+    - currency
+    - txn_date
+    - channel
+    - status
+  allowed_values:
+    txn_type:
+      - DEPOSIT
+      - WITHDRAWAL
+      - TRANSFER
+      - PAYMENT
+      - FEE
+      - INTEREST
+    currency:
+      - USD
+      - EUR
+      - GBP
+      - EGP
+    channel:
+      - ATM
+      - ONLINE
+      - BRANCH
+      - MOBILE
+      - POS
+    status:
+      - POSTED
+      - PENDING
+      - SETTLED
+
+fields:
+  mandatory:
+    - transaction_id
+    - account_id
+    - txn_type
+    - amount
+    - txn_date
+  amount:
+    min: 0.01
+    max: 1000000.00
+  date:
+    min: "2020-01-01"
+    max: "2026-11-05"
+
+referential:
+  reference_table: reference.accounts
+  foreign_key: account_id
+  reference_key: account_id
+  cache_ttl_seconds: 300
+
+quarantine:
+  max_reason_length: 500
+  table: quality.error_records
