@@ -15,15 +15,17 @@ ObsiFlow is a contract-first ETL and data-quality platform. It validates every b
 before loading, quarantines defective rows with complete failure reasons, guarantees
 idempotent reruns, and projects pipeline health into Prometheus and Grafana.
 
-The repository is a **production-grade working skeleton**: every boundary is wired,
-tested, and containerised so six engineering roles can work in parallel without
-integration blockers.
+The repository is an **interface-first base skeleton**: the shared contracts,
+database schema, containers, and CI are complete so six engineering roles can work
+in parallel. Role-owned modules are deliberate stubs marked with `TODO [ROLE]` and
+`NotImplementedError`; tests that depend on them are skipped until implemented.
 
 ---
 
 ## Table of Contents
 
 - [What the platform does](#what-the-platform-does)
+- [Team onboarding & where to write your code](#team-onboarding--where-to-write-your-code)
 - [Architecture](#architecture)
 - [Repository layout](#repository-layout)
 - [Quick start with Docker](#quick-start-with-docker)
@@ -54,6 +56,26 @@ integration blockers.
 - **Verifies** everything in CI: lint, unit rules, Airflow DagBag integrity,
   PostgreSQL integration, and Docker Compose validity.
 
+## Team onboarding & where to write your code
+
+The shared contract, schema, infrastructure, and CI are already in place. Implement
+the stubs below and keep changes inside your role's boundary. Changes to
+`etl/contracts.py`, `config/settings.py`, or `db/init.sql` require a coordinated PR
+because every role depends on them.
+
+| Role | Owns | Start here |
+|---|---|---|
+| **`[DE]`** Data Pipeline Engineering | Extraction, transformation, idempotent loading, stage service | `etl/extract.py`, `etl/transform.py`, `etl/load.py`, `etl/pipeline.py` |
+| **`[DQ]`** Data Quality | Six rule families, valid/invalid split, quarantine persistence, thresholds | `validation/engine.py`, `validation/quarantine.py`, `validation/rules/*.py`, `config/dq_rules_config.yaml` |
+| **`[OR]`** Orchestration & Reliability | DAG wiring, retries, failure callbacks, run audit logging | `dags/dq_etl_pipeline_dag.py` |
+| **`[OB]`** Observability | DB-backed exporter, metric projections, four alerts, Grafana provisioning | `monitoring/metrics.py`, `monitoring/prometheus.yml`, `monitoring/alert_rules.yml`, `monitoring/grafana/provisioning/` |
+| **`[QA]`** Quality Assurance | Unit, DagBag, integration, and telemetry test suites | `tests/unit/`, `tests/integration/`, `tests/dag_integrity/` |
+| **`[DO]`** DevOps | Images, Compose stack, environment templates, CI gates | `Dockerfile`, `docker-compose.yml`, `.github/workflows/ci.yml`, `.env.example`, `.gitignore` |
+
+Search for `TODO [DE]`, `TODO [DQ]`, `TODO [OR]`, `TODO [OB]`, `TODO [QA]`, and
+`TODO [DO]` to find every hand-off point. As a role finishes a module, remove the
+matching `@pytest.mark.skip(reason="Pending role implementation")` decorators.
+
 ## Architecture
 
 ```text
@@ -83,7 +105,7 @@ integration blockers.
 The Airflow DAG is deliberately thin:
 
 ```text
-begin_run → extract_and_validate → transform_and_load → finalize_run → emit_metrics → done
+begin_run → extract → validate → load → emit_metrics → done
 ```
 
 No pandas, psycopg2, or SQL lives in `dags/`. Permanent validation failures become

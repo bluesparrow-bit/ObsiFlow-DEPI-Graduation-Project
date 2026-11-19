@@ -16,7 +16,7 @@ from airflow.exceptions import AirflowFailException
 from dags.dq_etl_pipeline_dag import _on_failure, fail_fast
 from etl.contracts import PermanentPipelineError, TransientPipelineError
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.skip(reason="Pending role implementation")]
 
 T = TypeVar("T")
 

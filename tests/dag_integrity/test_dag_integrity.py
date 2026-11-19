@@ -46,9 +46,9 @@ def test_task_graph_is_acyclic_and_complete(dagbag: DagBag) -> None:
     dag = dagbag.dags[DAG_ID]
     expected_tasks = {
         "begin_run",
-        "extract_and_validate",
-        "transform_and_load",
-        "finalize_run",
+        "extract",
+        "validate",
+        "load",
         "emit_metrics",
         "done",
     }
