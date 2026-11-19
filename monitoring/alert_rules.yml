@@ -1,0 +1,55 @@
+groups:
+  - name: obsiflow.pipeline
+    rules:
+      - alert: PipelineRunFailed
+        expr: pipeline_last_run_status{status="failed"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          component: orchestration
+        annotations:
+          summary: "ObsiFlow pipeline run failed"
+          description: >-
+            The most recent run for DAG {{ $labels.dag_id }} finished in FAILED
+            state. Follow docs/runbook.md#pipelinerunfailed before rerunning.
+
+      - alert: PipelineStale
+        expr: >-
+          pipeline_last_success_timestamp_seconds > 0
+          and (time() - pipeline_last_success_timestamp_seconds) > 26 * 3600
+        for: 10m
+        labels:
+          severity: warning
+          component: orchestration
+        annotations:
+          summary: "No successful ObsiFlow run in over 26 hours"
+          description: >-
+            DAG {{ $labels.dag_id }} has not succeeded for more than 26 hours,
+            exceeding the daily schedule plus a two-hour grace window.
+
+      - alert: PipelineNeverReported
+        expr: >-
+          absent(pipeline_last_reported_timestamp_seconds)
+          or pipeline_last_reported_timestamp_seconds == 0
+        for: 10m
+        labels:
+          severity: critical
+          component: observability
+        annotations:
+          summary: "ObsiFlow has never reported telemetry"
+          description: >-
+            No pipeline run has ever been recorded. Check the exporter, database
+            connectivity, and whether the DAG has been unpaused.
+
+      - alert: HighRejectionRate
+        expr: pipeline_rejection_rate > 0.10
+        for: 5m
+        labels:
+          severity: warning
+          component: data-quality
+        annotations:
+          summary: "ObsiFlow rejection rate above 10%"
+          description: >-
+            The latest run for DAG {{ $labels.dag_id }} rejected
+            {{ $value | humanizePercentage }} of its rows. Inspect
+            quality.error_records by rule_family before the next schedule.

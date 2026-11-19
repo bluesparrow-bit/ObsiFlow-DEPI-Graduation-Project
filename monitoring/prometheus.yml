@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    platform: obsiflow
+
+rule_files:
+  - /etc/prometheus/alert_rules.yml
+
+scrape_configs:
+  - job_name: obsiflow-telemetry
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - metrics-exporter:9101
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
