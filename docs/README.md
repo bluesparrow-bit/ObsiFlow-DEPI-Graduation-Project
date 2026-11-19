@@ -8,7 +8,9 @@ Welcome to the documentation for **ObsiFlow (Data Quality & Pipeline Observabili
 
 ```text
 docs/
-├── architecture/         # System architecture, data flow, rule families, and design decisions
+├── architecture.md       # Canonical data flow, contracts, ownership, failure model
+├── runbook.md            # Alert response, recovery, quarantine, idempotency checks
+├── architecture/         # Baseline architecture notes and team decision log
 │   └── README.md
 ├── development/          # Local setup, environment configuration, and coding standards
 │   └── README.md
@@ -21,7 +23,18 @@ docs/
 
 ## Key Documentation Links
 
-- **Architecture & System Design**: [architecture/README.md](architecture/README.md)
+- **Canonical Architecture & Contracts**: [architecture.md](architecture.md)
+  - Module ownership and parallel-development boundaries
+  - Pydantic contracts, six rule families, and failure policy
+  - PostgreSQL persistence model and telemetry contract
+  - CI/test architecture and deployment topology
+
+- **Operations Runbook**: [runbook.md](runbook.md)
+  - Response procedures for all four Prometheus alerts
+  - Failure triage, quarantine inspection, and safe replay
+  - Idempotency verification and telemetry reconciliation
+
+- **Architecture Baseline Notes**: [architecture/README.md](architecture/README.md)
   - Data ingestion and validation pipeline flow
   - Six data quality rule families
   - Rejected-record quarantine model
