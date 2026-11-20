@@ -59,7 +59,6 @@ def base_row(**overrides: Any) -> dict[str, Any]:
     ],
     ids=["clean", "empty-account", "whitespace-amount", "null-date"],
 )
-@SKIP_PENDING
 def test_null_check_pass_fail(overrides: dict[str, Any], expected_count: int) -> None:
     violations = find_null_violations(make_frame([base_row(**overrides)]), MANDATORY)
     assert len(violations) == expected_count
@@ -82,7 +81,6 @@ def test_null_check_pass_fail(overrides: dict[str, Any], expected_count: int) ->
     ],
     ids=["unique", "duplicate-later", "keep-last", "case-insensitive"],
 )
-@SKIP_PENDING
 def test_duplicate_check_pass_fail(keys: list[str], policy: str, expected_rows: list[int]) -> None:
     frame = make_frame([base_row(transaction_id=key) for key in keys])
     violations = find_duplicates(frame, "transaction_id", policy=policy)  # type: ignore[arg-type]
@@ -105,7 +103,6 @@ def test_duplicate_check_pass_fail(keys: list[str], policy: str, expected_rows: 
     ],
     ids=["clean", "non-numeric-amount", "malformed-date", "lowercase-currency", "bad-enum"],
 )
-@SKIP_PENDING
 def test_schema_check_pass_fail(
     overrides: dict[str, Any],
     expected_count: int,
@@ -122,7 +119,6 @@ def test_schema_check_pass_fail(
 
 
 @pytest.mark.unit
-@SKIP_PENDING
 def test_schema_missing_column_is_blocking(dq_config: DQConfig) -> None:
     frame = make_frame([base_row()]).drop(columns=["amount"])
     result = check_schema(

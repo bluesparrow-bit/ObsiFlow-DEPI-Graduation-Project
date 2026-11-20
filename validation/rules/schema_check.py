@@ -38,7 +38,7 @@ def _cell(value: object) -> str:
 
 def _clean_message(message: str) -> str:
     if message.startswith(_PYDANTIC_VALUE_ERROR_PREFIX):
-        return message[len(_PYDANTIC_VALUE_ERROR_PREFIX):]
+        return message[len(_PYDANTIC_VALUE_ERROR_PREFIX) :]
     return message
 
 

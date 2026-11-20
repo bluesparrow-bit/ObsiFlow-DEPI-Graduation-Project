@@ -19,7 +19,9 @@ def _clean_key(value: object) -> str:
             return ""
     except (TypeError, ValueError):
         pass
-    return str(value).strip()
+    # Business keys are case-insensitive; keep this aligned with the contract
+    # test and the referential rule's normalization.
+    return str(value).strip().upper()
 
 
 def find_duplicates(
