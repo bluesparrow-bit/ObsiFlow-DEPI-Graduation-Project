@@ -99,7 +99,7 @@ jobs:
       OBSIFLOW_POSTGRES_USER: obsiflow
       OBSIFLOW_POSTGRES_PASSWORD: obsiflow
       OBSIFLOW_REQUIRE_DB: "1"
-      AIRFLOW_HOME: ${{ runner.temp }}/airflow-home
+      AIRFLOW_HOME: ${{ github.workspace }}/airflow-home
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__UNIT_TEST_MODE: "True"
     steps:
