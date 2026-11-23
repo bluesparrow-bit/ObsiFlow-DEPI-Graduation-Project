@@ -141,7 +141,6 @@ def test_schema_missing_column_is_blocking(dq_config: DQConfig) -> None:
     [(10, 0), (100, 0), (9, 1), (101, 1)],
     ids=["min-boundary", "inside", "too-few", "too-many"],
 )
-@SKIP_PENDING
 def test_row_count_check_pass_fail(total: int, expected_count: int) -> None:
     violations = check_row_count(total_rows=total, min_rows=10, max_rows=100)
     assert len(violations) == expected_count
@@ -175,7 +174,6 @@ def test_row_count_check_pass_fail(total: int, expected_count: int) -> None:
         "date-too-new",
     ],
 )
-@SKIP_PENDING
 def test_range_check_pass_fail(overrides: dict[str, Any], expected_count: int) -> None:
     violations = check_ranges(
         make_frame([base_row(**overrides)]),
