@@ -197,7 +197,6 @@ def test_range_check_pass_fail(overrides: dict[str, Any], expected_count: int) -
     [("ACC000001", 0), ("acc000001", 0), ("ACC999999", 1), ("", 0)],
     ids=["known", "case-insensitive", "orphan", "blank-ignored"],
 )
-@SKIP_PENDING
 def test_referential_check_pass_fail(account_id: str, expected_count: int) -> None:
     violations = check_referential(
         make_frame([base_row(account_id=account_id)]),
