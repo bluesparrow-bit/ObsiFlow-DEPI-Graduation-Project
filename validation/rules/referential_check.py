@@ -6,7 +6,7 @@ from collections.abc import Collection
 
 import pandas as pd
 
-from etl.contracts import Violation
+from etl.contracts import RuleFamily, Violation
 
 
 def check_referential(
@@ -21,4 +21,21 @@ def check_referential(
     snapshot or an in-memory fixture, keeping the rule unit-testable without I/O.
     """
 
-    raise NotImplementedError("TODO [DQ]: Implement this validation rule")
+    normalized_valid_keys = {key.strip().upper() for key in valid_keys}
+    violations: list[Violation] = []
+    for row_num, (_, row) in enumerate(frame.iterrows(), 2):
+        raw_key = row[foreign_key]
+        if pd.isna(raw_key) or not str(raw_key).strip():
+            continue
+
+        normalized_key = str(raw_key).strip().upper()
+        if normalized_key not in normalized_valid_keys:
+            violations.append(
+                Violation(
+                    family=RuleFamily.REFERENTIAL,
+                    field=foreign_key,
+                    row_number=row_num,
+                    message=f"FOREIGN KEY constraint failed for key: {normalized_key}",
+                )
+            )
+    return violations
