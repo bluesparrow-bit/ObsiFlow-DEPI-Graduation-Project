@@ -19,50 +19,44 @@ def _hash_file(path: Path) -> str:
 def test_generator_deterministic_output(tmp_path: Path) -> None:
     out1 = tmp_path / "run1"
     out2 = tmp_path / "run2"
+    out3 = tmp_path / "run3"
 
-    cmd1 = [
+    base_cmd = [
         sys.executable,
         "data/genration_script/generate_data.py",
-        "--out",
-        str(out1),
         "--rows",
-        "30",
+        "100",
         "--accounts",
-        "10",
-        "--seed",
-        "123",
-    ]
-    cmd2 = [
-        sys.executable,
-        "data/genration_script/generate_data.py",
-        "--out",
-        str(out2),
-        "--rows",
-        "30",
-        "--accounts",
-        "10",
-        "--seed",
-        "123",
+        "20",
     ]
 
-    res1 = subprocess.run(cmd1, capture_output=True, text=True, check=True)
-    res2 = subprocess.run(cmd2, capture_output=True, text=True, check=True)
+    res1 = subprocess.run([*base_cmd, "--out", str(out1), "--seed", "42"], check=True)
+    res2 = subprocess.run([*base_cmd, "--out", str(out2), "--seed", "42"], check=True)
+    res3 = subprocess.run([*base_cmd, "--out", str(out3), "--seed", "99"], check=True)
 
     assert res1.returncode == 0
     assert res2.returncode == 0
+    assert res3.returncode == 0
 
     clean1 = out1 / "batches" / "transactions_clean_1000.csv"
     clean2 = out2 / "batches" / "transactions_clean_1000.csv"
+    clean3 = out3 / "batches" / "transactions_clean_1000.csv"
+
     assert clean1.exists()
     assert clean2.exists()
+    assert clean3.exists()
+
+    # Same seed => identical hash
     assert _hash_file(clean1) == _hash_file(clean2)
+    # Different seed => distinct hash
+    assert _hash_file(clean1) != _hash_file(clean3)
 
     manifest1 = json.loads((out1 / "expected" / "manifest.json").read_text(encoding="utf-8"))
     manifest2 = json.loads((out2 / "expected" / "manifest.json").read_text(encoding="utf-8"))
+    manifest3 = json.loads((out3 / "expected" / "manifest.json").read_text(encoding="utf-8"))
+
     assert manifest1 == manifest2
-    assert "batches" in manifest1
-    assert "clean" in manifest1["batches"]
-    assert manifest1["batches"]["clean"]["total_rows"] == 30
+    assert manifest1["generator"]["seed"] != manifest3["generator"]["seed"]
 
 
 @pytest.mark.unit
@@ -74,7 +68,7 @@ def test_generator_creates_all_expected_fixtures(tmp_path: Path) -> None:
         "--out",
         str(out),
         "--rows",
-        "20",
+        "1000",
         "--seed",
         "42",
     ]

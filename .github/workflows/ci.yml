@@ -23,47 +23,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify no unallowed or sensitive files are tracked
-        run: |
-          echo "Auditing tracked files..."
-          tracked="$(git ls-files)"
-          echo "$tracked" | grep -E "(^|/)\.env($|\..*)" | grep -v "\.env\.example$" && {
-            echo "ERROR: Tracked .env secret file found!"
-            exit 1
-          } || true
-
-          echo "$tracked" | grep -E "\.(log|sqlite|sqlite3|dump|sql\.gz)$" && {
-            echo "ERROR: Tracked logs or database binary dumps found!"
-            exit 1
-          } || true
-
-          echo "$tracked" | grep -E "(raw_counters_report\.json|standalone_admin_password\.txt)" && {
-            echo "ERROR: Tracked generated report or temporary password found!"
-            exit 1
-          } || true
-
-          echo "$tracked" | grep -E "data/(staging|batches)/.*\.csv$" && {
-            echo "ERROR: Tracked batch or staging CSV files found!"
-            exit 1
-          } || true
-
-          echo "$tracked" | grep -E "data/genration_script/output/.*" && {
-            echo "ERROR: Tracked generator output found!"
-            exit 1
-          } || true
-
-          echo "$tracked" | grep -F "\\" && {
-            echo "ERROR: Non-POSIX path with backslash found in git tree!"
-            exit 1
-          } || true
-
-          echo "Repository hygiene checks passed cleanly."
-      - name: Check for leftover git conflict markers
-        run: |
-          if git grep -n -E "^(<<<<<<<|=======|>>>>>>>)" -- ':!*.pdf'; then
-            echo "ERROR: Leftover git merge conflict markers detected!"
-            exit 1
-          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Run repository hygiene audit
+        run: python scripts/check_hygiene.py
 
   config-validation:
     name: Configuration & schema validation
@@ -122,11 +86,19 @@ jobs:
           EOF
       - name: Test data generator determinism
         run: |
-          python data/genration_script/generate_data.py --out /tmp/gen_test --rows 50 --seed 42
-          test -f /tmp/gen_test/reference/accounts.csv
-          test -f /tmp/gen_test/batches/transactions_clean_1000.csv
-          test -f /tmp/gen_test/expected/manifest.json
-          echo "Data generator verified successfully."
+          # 1. Run twice with identical seed -> outputs must match byte-for-byte
+          python data/genration_script/generate_data.py --out /tmp/gen_seed42_a --rows 1000 --seed 42
+          python data/genration_script/generate_data.py --out /tmp/gen_seed42_b --rows 1000 --seed 42
+          diff -r /tmp/gen_seed42_a /tmp/gen_seed42_b
+          echo "Determinism verified: identical seeds produce identical output."
+
+          # 2. Run with different seed -> output must diverge
+          python data/genration_script/generate_data.py --out /tmp/gen_seed99 --rows 1000 --seed 99
+          if cmp -s /tmp/gen_seed42_a/batches/transactions_clean_1000.csv /tmp/gen_seed99/batches/transactions_clean_1000.csv; then
+            echo "ERROR: Generator produced identical output with different seeds!"
+            exit 1
+          fi
+          echo "Seed variation verified: different seeds produce distinct output."
 
   lint:
     name: Lint (ruff)
@@ -140,9 +112,9 @@ jobs:
       - name: Install ruff
         run: python -m pip install "ruff==0.7.4"
       - name: Ruff lint
-        run: ruff check config etl validation dags monitoring tests src
+        run: ruff check config etl validation dags monitoring tests src scripts
       - name: Ruff format check
-        run: ruff format --check config etl validation dags monitoring tests src
+        run: ruff format --check config etl validation dags monitoring tests src scripts
 
   unit:
     name: Unit tests

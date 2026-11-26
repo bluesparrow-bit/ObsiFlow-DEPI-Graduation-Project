@@ -7,6 +7,7 @@ set -euo pipefail
 COLOR_RESET="\033[0m"
 COLOR_GREEN="\033[1;32m"
 COLOR_RED="\033[1;31m"
+COLOR_YELLOW="\033[1;33m"
 COLOR_BLUE="\033[1;34m"
 
 log_info() {
@@ -26,40 +27,19 @@ cd "${ROOT_DIR}"
 
 log_info "Running ObsiFlow Repository Quality Checks..."
 
-# 1. Repository hygiene: tracked files audit
+# 1. Repository hygiene: single source of truth via check_hygiene.py
 log_info "1. Auditing Git repository hygiene and sensitive files..."
-tracked="$(git ls-files)"
-
-if echo "$tracked" | grep -E "(^|/)\.env($|\..*)" | grep -v "\.env\.example$" >/dev/null 2>&1; then
-    log_fail "Tracked .env file detected!"
-    exit 1
-fi
-
-if echo "$tracked" | grep -E "\.(log|sqlite|sqlite3|dump|sql\.gz)$" >/dev/null 2>&1; then
-    log_fail "Tracked database dump or log file detected!"
-    exit 1
-fi
-
-if echo "$tracked" | grep -E "(raw_counters_report\.json|standalone_admin_password\.txt)" >/dev/null 2>&1; then
-    log_fail "Tracked generated artifacts or standalone password detected!"
-    exit 1
-fi
-
-if echo "$tracked" | grep -E "data/(staging|batches)/.*\.csv$" >/dev/null 2>&1; then
-    log_fail "Tracked batch CSV files detected!"
-    exit 1
-fi
-
-if echo "$tracked" | grep -F "\\" >/dev/null 2>&1; then
-    log_fail "Non-POSIX path with backslashes detected in git tree!"
-    exit 1
-fi
+python3 scripts/check_hygiene.py
 log_pass "Repository hygiene verified: no forbidden or generated files tracked."
 
 # 2. Ruff Linting & Formatting Check
 log_info "2. Checking code formatting and linting (ruff)..."
-ruff check config etl validation dags monitoring tests src
-ruff format --check config etl validation dags monitoring tests src
+RUFF_VER=$(ruff --version 2>/dev/null | awk '{print $2}' || echo "unknown")
+if [[ "${RUFF_VER}" != "0.7.4" ]]; then
+    echo -e "${COLOR_YELLOW}[WARN]${COLOR_RESET} Local ruff version (${RUFF_VER}) differs from CI (0.7.4). Recommend: pip install 'ruff==0.7.4'"
+fi
+ruff check config etl validation dags monitoring tests src scripts
+ruff format --check config etl validation dags monitoring tests src scripts
 log_pass "Ruff checks and formatting passed cleanly."
 
 # 3. YAML & SQL Configuration Validation
@@ -107,12 +87,18 @@ log_pass "Unit test suite passed all checks with >80% coverage."
 
 # 5. Data Generator Determinism
 log_info "5. Verifying banking test-data generator determinism..."
-python3 data/genration_script/generate_data.py --out /tmp/obsiflow_local_gen --rows 30 --seed 42 >/dev/null
-test -f /tmp/obsiflow_local_gen/reference/accounts.csv
-test -f /tmp/obsiflow_local_gen/batches/transactions_clean_1000.csv
-test -f /tmp/obsiflow_local_gen/expected/manifest.json
-rm -rf /tmp/obsiflow_local_gen
-log_pass "Banking test-data generator verified."
+rm -rf /tmp/obsiflow_gen_a /tmp/obsiflow_gen_b /tmp/obsiflow_gen_c
+python3 data/genration_script/generate_data.py --out /tmp/obsiflow_gen_a --rows 1000 --seed 42 >/dev/null
+python3 data/genration_script/generate_data.py --out /tmp/obsiflow_gen_b --rows 1000 --seed 42 >/dev/null
+diff -r /tmp/obsiflow_gen_a /tmp/obsiflow_gen_b >/dev/null
+
+python3 data/genration_script/generate_data.py --out /tmp/obsiflow_gen_c --rows 1000 --seed 99 >/dev/null
+if cmp -s /tmp/obsiflow_gen_a/batches/transactions_clean_1000.csv /tmp/obsiflow_gen_c/batches/transactions_clean_1000.csv; then
+    log_fail "Generator produced identical output with different seeds!"
+    exit 1
+fi
+rm -rf /tmp/obsiflow_gen_a /tmp/obsiflow_gen_b /tmp/obsiflow_gen_c
+log_pass "Banking test-data generator determinism verified."
 
 echo -e "\n${COLOR_GREEN}======================================================${COLOR_RESET}"
 echo -e "${COLOR_GREEN} All quality gates and pre-flight checks PASSED! ${COLOR_RESET}"

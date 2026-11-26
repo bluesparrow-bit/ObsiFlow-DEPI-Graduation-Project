@@ -3,52 +3,68 @@
 from __future__ import annotations
 
 import ast
-import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
+
+from scripts.check_hygiene import (
+    check_posix_paths,
+    find_conflict_markers,
+    find_forbidden_files,
+    get_tracked_files,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.unit
 def test_no_sensitive_or_generated_files_tracked() -> None:
-    result = subprocess.run(
-        ["git", "ls-files"],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    tracked_files = result.stdout.splitlines()
+    tracked_files = get_tracked_files(PROJECT_ROOT)
+    violations = find_forbidden_files(tracked_files)
+    assert not violations, f"Forbidden or sensitive files tracked in git: {violations}"
 
-    forbidden_exact = {
+    non_posix = check_posix_paths(tracked_files)
+    assert not non_posix, f"Non-POSIX paths found: {non_posix}"
+
+
+@pytest.mark.unit
+def test_no_unresolved_merge_conflicts() -> None:
+    conflicts = find_conflict_markers(PROJECT_ROOT)
+    assert not conflicts, f"Unresolved merge conflict markers detected in: {conflicts}"
+
+
+@pytest.mark.unit
+def test_hygiene_detection_rules_synthetic() -> None:
+    synthetic = [
         ".env",
+        ".env.local",
+        ".env.example",
+        "data/sample_valid.csv",
+        "data/sample_corrupted.csv",
+        "data/staging/batch_01.csv",
+        "data/batches/test.csv",
+        "data/genration_script/output/dump.csv",
+        "dump.sqlite3",
+        "debug.log",
         "raw_counters_report.json",
         "standalone_admin_password.txt",
-    }
-    forbidden_suffixes = (
-        ".log",
-        ".sqlite",
-        ".sqlite3",
-        ".dump",
-        ".sql.gz",
-    )
+    ]
+    forbidden = find_forbidden_files(synthetic)
+    assert ".env" in forbidden
+    assert ".env.local" in forbidden
+    assert ".env.example" not in forbidden
+    assert "data/sample_valid.csv" not in forbidden
+    assert "data/sample_corrupted.csv" not in forbidden
+    assert "data/staging/batch_01.csv" in forbidden
+    assert "data/batches/test.csv" in forbidden
+    assert "data/genration_script/output/dump.csv" in forbidden
+    assert "dump.sqlite3" in forbidden
+    assert "debug.log" in forbidden
+    assert "raw_counters_report.json" in forbidden
+    assert "standalone_admin_password.txt" in forbidden
 
-    def _is_forbidden(file_path: str) -> bool:
-        name = Path(file_path).name
-        if name in forbidden_exact or name.endswith(forbidden_suffixes):
-            return True
-        if name.startswith(".env.") and name != ".env.example":
-            return True
-        if "data/staging" in file_path and file_path.endswith(".csv"):
-            return True
-        return "data/genration_script/output" in file_path
-
-    violations = [f for f in tracked_files if _is_forbidden(f)]
-
-    assert not violations, f"Forbidden or sensitive files tracked in git: {violations}"
+    assert check_posix_paths(["a/b/c.py", "a\\b\\c.py"]) == ["a\\b\\c.py"]
 
 
 @pytest.mark.unit
@@ -65,7 +81,6 @@ def test_all_yaml_files_are_valid() -> None:
     for yml in yaml_files:
         content = yml.read_text(encoding="utf-8")
         try:
-            # Multi-document files like workflow or grafana provision
             list(yaml.safe_load_all(content))
         except Exception as exc:
             pytest.fail(f"YAML parsing failed for {yml}: {exc}")
