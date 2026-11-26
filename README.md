@@ -380,3 +380,20 @@ Ownership boundaries and parallel-development rules are documented in
 - Use `.env.example` as the template and inject real secrets in your environment.
 - The Compose defaults are development-only; production must use managed secrets,
   a separate Airflow metadata database, TLS, and least-privilege database roles.
+## Observability (Role 4)
+
+The platform exposes pipeline health through Prometheus and Grafana.
+
+- **Metrics exporter** (`monitoring/metrics.py`): reads run history from PostgreSQL and exposes metrics on port 9101 (`/metrics`): run duration, success/failed runs, processed/loaded/rejected records, and data-quality failures per rule family.
+- **Prometheus** (`monitoring/prometheus.yml`): scrapes the exporter every 15 seconds.
+- **Alerts** (`monitoring/alert_rules.yml`): alert rules for pipeline failures and abnormal runs.
+- **Grafana dashboard** (`monitoring/grafana/provisioning`): auto-loaded dashboard showing duration, run status, record counts, and DQ errors.
+
+### How to run
+    docker compose up -d --build
+
+| Service | URL |
+|---|---|
+| Metrics | http://localhost:9101/metrics |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3000 (admin / admin) |

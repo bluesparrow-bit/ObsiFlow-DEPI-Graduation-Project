@@ -1,9 +1,3 @@
-# ObsiFlow Prometheus scrape configuration.
-#
-# TODO [OB]: Keep the exporter contract below stable while implementing
-# monitoring/metrics.py.  Required metric families are documented there and in
-# docs/architecture.md (runs, records, DQ failures, last status, staleness,
-# rejection rate, DB up, exporter refresh).
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
@@ -20,8 +14,6 @@ scrape_configs:
       - targets:
           - metrics-exporter:9101
 
-  # TODO [OB]: Add scrape targets for the exporter's own health endpoint,
-  # PostgreSQL exporter, or Airflow metrics if the team adopts them.
   - job_name: prometheus
     static_configs:
       - targets:
