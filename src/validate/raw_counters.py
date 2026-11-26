@@ -1,9 +1,10 @@
 """
 Task: OFP-3 - Raw Counters
 Description:
-    Count Rows, Columns, Nulls, Duplication, 
+    Count Rows, Columns, Nulls, Duplication,
     Data Ranges, Data Types, and Raw Columns Order.
 """
+
 import argparse
 import csv
 import hashlib
@@ -12,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ def _is_bool(val: str) -> bool:
     return val.lower() in {"true", "false", "yes", "no"}
 
 
-def _parse_date(val: str) -> Optional[datetime]:
+def _parse_date(val: str) -> datetime | None:
     for fmt in DATE_FORMATS:
         try:
             return datetime.strptime(val, fmt)
@@ -65,12 +66,12 @@ class _ColumnStreamStats:
     bool_count: int = 0
     date_count: int = 0
 
-    num_min: Optional[float] = None
-    num_max: Optional[float] = None
-    date_min: Optional[Tuple[datetime, str]] = None
-    date_max: Optional[Tuple[datetime, str]] = None
-    str_min: Optional[str] = None
-    str_max: Optional[str] = None
+    num_min: float | None = None
+    num_max: float | None = None
+    date_min: tuple[datetime, str] | None = None
+    date_max: tuple[datetime, str] | None = None
+    str_min: str | None = None
+    str_max: str | None = None
 
     def update(self, raw_val: str) -> None:
         val = raw_val.strip() if raw_val else ""
@@ -102,7 +103,7 @@ class _ColumnStreamStats:
             if self.date_max is None or parsed_dt > self.date_max[0]:
                 self.date_max = (parsed_dt, val)
 
-    def _update_num_bounds(self, num: Union[int, float]) -> None:
+    def _update_num_bounds(self, num: int | float) -> None:
         if self.num_min is None or num < self.num_min:
             self.num_min = num
         if self.num_max is None or num > self.num_max:
@@ -122,7 +123,7 @@ class _ColumnStreamStats:
             return "datetime"
         return "string"
 
-    def get_range(self, col_type: str) -> Dict[str, Optional[Any]]:
+    def get_range(self, col_type: str) -> dict[str, Any | None]:
         if self.non_null_count == 0:
             return {"min": None, "max": None}
 
@@ -149,17 +150,17 @@ class CSVProfiler:
 
     def __init__(
         self,
-        file_path: Union[str, Path],
-        key_column: Optional[str] = "transaction_id",
+        file_path: str | Path,
+        key_column: str | None = "transaction_id",
     ):
         self.path = Path(file_path)
         self.key_column = key_column
 
-    def _hash_row(self, row: List[str]) -> str:
+    def _hash_row(self, row: list[str]) -> str:
         raw = "||".join(f.strip() for f in row)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def analyze(self) -> Dict[str, Any]:
+    def analyze(self) -> dict[str, Any]:
         if not self.path.is_file():
             raise FileNotFoundError(f"CSV file not found: {self.path.as_posix()}")
 
@@ -171,7 +172,7 @@ class CSVProfiler:
                     return self._empty_report()
 
                 columns = [h.strip() for h in headers]
-                col_stats: Dict[str, _ColumnStreamStats] = {
+                col_stats: dict[str, _ColumnStreamStats] = {
                     col: _ColumnStreamStats() for col in columns
                 }
 
@@ -209,9 +210,9 @@ class CSVProfiler:
                         val = row[idx] if idx < len(row) else ""
                         col_stats[col].update(val)
 
-                null_counts: Dict[str, int] = {}
-                data_types: Dict[str, str] = {}
-                data_ranges: Dict[str, Dict[str, Optional[Any]]] = {}
+                null_counts: dict[str, int] = {}
+                data_types: dict[str, str] = {}
+                data_ranges: dict[str, dict[str, Any | None]] = {}
                 total_nulls = 0
 
                 for col in columns:
@@ -240,7 +241,7 @@ class CSVProfiler:
             logger.exception("Failed to profile CSV file: %s", self.path.as_posix())
             raise
 
-    def _empty_report(self) -> Dict[str, Any]:
+    def _empty_report(self) -> dict[str, Any]:
         return {
             "file_name": self.path.name,
             "file_path": self.path.as_posix(),
@@ -255,8 +256,8 @@ class CSVProfiler:
         }
 
 
-def find_csv_files(directories: List[str]) -> List[Path]:
-    files: List[Path] = []
+def find_csv_files(directories: list[str]) -> list[Path]:
+    files: list[Path] = []
     for dir_path in directories:
         target = Path(dir_path)
         if target.exists():
@@ -265,36 +266,34 @@ def find_csv_files(directories: List[str]) -> List[Path]:
 
 
 def profile_directories(
-    target_directories: List[str],
-    key_column: Optional[str] = "transaction_id",
-) -> List[Dict[str, Any]]:
+    target_directories: list[str],
+    key_column: str | None = "transaction_id",
+) -> list[dict[str, Any]]:
     """Pure library entrypoint for Airflow tasks (returns XCom-serializable dicts)."""
     csv_files = find_csv_files(target_directories)
-    return [
-        CSVProfiler(file_path, key_column=key_column).analyze()
-        for file_path in csv_files
-    ]
+    return [CSVProfiler(file_path, key_column=key_column).analyze() for file_path in csv_files]
 
 
-def print_summary_table(results: List[Dict[str, Any]]) -> None:
+def print_summary_table(results: list[dict[str, Any]]) -> None:
     headers = ["File Name", "Rows", "Cols", "Total Nulls", "Duplicates", "Columns Order"]
     rows = []
     for r in results:
         cols_str = ", ".join(r["raw_columns_order"])
         if len(cols_str) > 30:
             cols_str = cols_str[:27] + "..."
-        rows.append([
-            r["file_name"],
-            str(r["row_count"]),
-            str(r["column_count"]),
-            str(r["total_nulls_count"]),
-            str(r["duplicated_rows_count"]),
-            cols_str,
-        ])
+        rows.append(
+            [
+                r["file_name"],
+                str(r["row_count"]),
+                str(r["column_count"]),
+                str(r["total_nulls_count"]),
+                str(r["duplicated_rows_count"]),
+                cols_str,
+            ]
+        )
 
     col_widths = [
-        max(len(h), max((len(r[i]) for r in rows), default=0))
-        for i, h in enumerate(headers)
+        max(len(h), max((len(r[i]) for r in rows), default=0)) for i, h in enumerate(headers)
     ]
     row_format = " | ".join(f"{{:<{w}}}" for w in col_widths)
 
@@ -322,7 +321,10 @@ def main() -> None:
     parser.add_argument(
         "--key-column",
         default="transaction_id",
-        help="Column name used for key-level duplicate detection (falls back to full-row hash if absent).",
+        help=(
+            "Column name used for key-level duplicate detection "
+            "(falls back to full-row hash if absent)."
+        ),
     )
     parser.add_argument(
         "--out",

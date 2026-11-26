@@ -112,11 +112,15 @@ standalone_admin_password.txt
 data/*
 !data/genration_script
 !data/genration_script/**
+data/genration_script/output/
 !data/sample_valid.csv
 !data/sample_corrupted.csv
 data/staging/
 data/genration_script/__pycache__/
 data/genration_script/*.py[cod]
+raw_counters_report.json
+*.json.report
+docs/*.docx
 
 # ------------------------------------------------------------------------------
 # Airflow runtime (project-root layout)

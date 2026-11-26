@@ -96,8 +96,7 @@ def check_ranges(
                         field="txn_date",
                         row_number=row_num,
                         message=(
-                            f"Date {transaction_date} is higher than "
-                            f"the maximum date: {date_max}"
+                            f"Date {transaction_date} is higher than the maximum date: {date_max}"
                         ),
                     )
                 )
@@ -109,7 +108,7 @@ def check_ranges(
                         field="txn_date",
                         row_number=row_num,
                         message=(
-                            f"Date {transaction_date} is less than " f"the minimum date: {date_min}"
+                            f"Date {transaction_date} is less than the minimum date: {date_min}"
                         ),
                     )
                 )
