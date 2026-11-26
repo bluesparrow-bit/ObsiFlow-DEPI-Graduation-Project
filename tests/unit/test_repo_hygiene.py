@@ -109,6 +109,6 @@ def test_all_unit_tests_have_marker() -> None:
                 if not has_unit_mark:
                     missing_marker.append(f"{f.name}::{node.name}")
 
-    assert not missing_marker, (
-        f"The following unit tests are missing the @pytest.mark.unit decorator: {missing_marker}"
-    )
+    assert (
+        not missing_marker
+    ), f"The following unit tests are missing the @pytest.mark.unit decorator: {missing_marker}"
