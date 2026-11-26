@@ -24,12 +24,12 @@ log = logging.getLogger("obsiflow.exporter")
 TABLE = "observability.pipeline_runs"
 COL_STATUS = "status"
 COL_STARTED = "started_at"
-COL_FINISHED = "finished_at"            # may be called ended_at / completed_at
+COL_FINISHED = "finished_at"  # may be called ended_at / completed_at
 COL_EXTRACTED = "records_extracted"
 COL_LOADED = "records_loaded"
 COL_REJECTED = "records_rejected"
 COL_REJ_RATE = "rejection_rate"
-COL_ERRORS = "error_summary"            # per-family failures (JSON expected)
+COL_ERRORS = "error_summary"  # per-family failures (JSON expected)
 # ---------------------------------------------------------------------------
 
 DAG_ID = os.getenv("OBSIFLOW_DAG_ID", "dq_etl_pipeline")
@@ -105,9 +105,17 @@ class PipelineCollector:
         )
         extracted, loaded, rejected = cur.fetchone()
         for name, doc, val in (
-            ("pipeline_records_processed_total", "Extracted rows across runs", extracted),
+            (
+                "pipeline_records_processed_total",
+                "Extracted rows across runs",
+                extracted,
+            ),
             ("pipeline_records_loaded_total", "Loaded rows across runs", loaded),
-            ("pipeline_records_rejected_total", "Quarantined rows across runs", rejected),
+            (
+                "pipeline_records_rejected_total",
+                "Quarantined rows across runs",
+                rejected,
+            ),
         ):
             g = GaugeMetricFamily(name, doc)
             g.add_metric([], float(val))
@@ -117,7 +125,8 @@ class PipelineCollector:
         cur.execute(
             f"SELECT COALESCE(EXTRACT(EPOCH FROM MAX({COL_FINISHED})) FILTER "
             f"(WHERE {COL_STATUS}='SUCCESS'), 0), "
-            f"COALESCE(EXTRACT(EPOCH FROM MAX(COALESCE({COL_FINISHED},{COL_STARTED}))), 0) "
+            "COALESCE(EXTRACT(EPOCH FROM MAX("
+            f"COALESCE({COL_FINISHED},{COL_STARTED}))), 0) "
             f"FROM {TABLE}"
         )
         last_success, last_reported = cur.fetchone()
@@ -166,6 +175,43 @@ class PipelineCollector:
         for family, count in _family_counts(errors).items():
             g.add_metric([family], count)
         yield g
+
+
+def emit_run_metrics(run_id: str | None = None, *args, **kwargs) -> dict:
+    """Hook called by the DAG's ``emit_metrics`` task.
+
+    The exporter is DB-backed: every metric is derived from
+    observability.pipeline_runs on scrape, so there is nothing to push here.
+    This logs a snapshot of the run so the Airflow task log shows what
+    Prometheus will report. It never raises, so telemetry cannot fail a run.
+    """
+    snapshot: dict = {"run_id": run_id, "status": None, "found": False}
+    try:
+        conn = _connect()
+        try:
+            with conn, conn.cursor() as cur:
+                if run_id:
+                    cur.execute(
+                        f"SELECT {COL_STATUS}, {COL_REJ_RATE} FROM {TABLE} "
+                        "WHERE run_id = %s",
+                        (str(run_id),),
+                    )
+                else:
+                    cur.execute(
+                        f"SELECT {COL_STATUS}, {COL_REJ_RATE} FROM {TABLE} "
+                        f"ORDER BY {COL_STARTED} DESC LIMIT 1"
+                    )
+                row = cur.fetchone()
+                if row:
+                    snapshot.update(
+                        found=True, status=row[0], rejection_rate=float(row[1] or 0)
+                    )
+        finally:
+            conn.close()
+    except Exception:
+        log.exception("emit_run_metrics could not read run state")
+    log.info("emit_run_metrics snapshot: %s", snapshot)
+    return snapshot
 
 
 def main() -> None:
