@@ -1,26 +1,40 @@
-# ObsiFlow alerting rules.
-#
-# TODO [OB]: Implement the four required rules below.  Keep the alert names and
-# severity contract stable so docs/runbook.md and Grafana links stay valid.
-#
-# 1. PipelineRunFailed
-#    Latest run status is failed:
-#    pipeline_last_run_status{status="failed"} == 1
-#
-# 2. PipelineStale
-#    No successful run in more than 26 hours (daily schedule + 2h grace):
-#    pipeline_last_success_timestamp_seconds > 0
-#    and (time() - pipeline_last_success_timestamp_seconds) > 26 * 3600
-#
-# 3. PipelineNeverReported
-#    Telemetry has never been reported:
-#    absent(pipeline_last_reported_timestamp_seconds)
-#    or pipeline_last_reported_timestamp_seconds == 0
-#
-# 4. HighRejectionRate
-#    Latest run rejected more than 10% of extracted rows:
-#    pipeline_rejection_rate > 0.10
-#
 groups:
-  - name: obsiflow.pipeline
-    rules: []
+  - name: obsiflow-pipeline
+    rules:
+      - alert: PipelineRunFailed
+        expr: pipeline_last_run_status{status="FAILED"} == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Latest ObsiFlow pipeline run FAILED"
+          description: "Check observability.pipeline_runs and quality.error_records. See docs/runbook.md."
+
+      - alert: PipelineStale
+        expr: |
+          pipeline_last_reported_timestamp_seconds > 0
+          and (time() - pipeline_last_success_timestamp_seconds) > 26 * 3600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No successful pipeline run for more than 26 hours"
+          description: "Last success was {{ $value | humanizeDuration }} ago."
+
+      - alert: PipelineNeverReported
+        expr: pipeline_last_reported_timestamp_seconds == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline has never reported a run"
+          description: "observability.pipeline_runs is empty. Trigger the DAG or check the exporter."
+
+      - alert: HighRejectionRate
+        expr: pipeline_rejection_rate > 0.10
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rejection rate above 10%"
+          description: "Latest run rejected {{ $value | humanizePercentage }} of rows."
