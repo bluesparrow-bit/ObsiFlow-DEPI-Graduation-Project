@@ -1,227 +1,5401 @@
-"""ObsiFlow [OB] - DB-backed Prometheus exporter.
+"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
 
-Reads observability.pipeline_runs on every scrape and exposes gauges on :9101.
-Because values come from PostgreSQL (not in-process counters), a restart of the
-exporter or an Airflow worker never resets history.
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
+import signal
+import threading
 import time
+from datetime import datetime
+from typing import Any
 
-import psycopg2
-from prometheus_client import start_http_server
-from prometheus_client.core import REGISTRY, GaugeMetricFamily
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
 
-log = logging.getLogger("obsiflow.exporter")
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
 
-# ---------------------------------------------------------------------------
-# CHECK THESE AGAINST db/init.sql  (the only place names may need editing)
-# ---------------------------------------------------------------------------
-TABLE = "observability.pipeline_runs"
-COL_STATUS = "status"
-COL_STARTED = "started_at"
-COL_FINISHED = "finished_at"  # may be called ended_at / completed_at
-COL_EXTRACTED = "records_extracted"
-COL_LOADED = "records_loaded"
-COL_REJECTED = "records_rejected"
-COL_REJ_RATE = "rejection_rate"
-COL_ERRORS = "error_summary"  # per-family failures (JSON expected)
-# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 
-DAG_ID = os.getenv("OBSIFLOW_DAG_ID", "dq_etl_pipeline")
-PORT = int(os.getenv("EXPORTER_PORT", "9101"))
-STATUSES = ["SUCCESS", "FAILED", "RUNNING"]
-RULE_FAMILIES = ["null", "duplicate", "schema", "row_count", "range", "referential"]
+REGISTRY = CollectorRegistry()
 
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
 
-def _connect():
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "postgres"),
-        port=int(os.getenv("POSTGRES_PORT", "5432")),
-        dbname=os.getenv("POSTGRES_DB", "obsiflow"),
-        user=os.getenv("POSTGRES_USER", "obsiflow"),
-        password=os.getenv("POSTGRES_PASSWORD", ""),
-        connect_timeout=5,
-    )
-
-
-def _family_counts(raw) -> dict[str, float]:
-    """Turn error_summary into {family: failures}. Tolerates str/dict/list."""
-    counts = {f: 0.0 for f in RULE_FAMILIES}
-    try:
-        data = json.loads(raw) if isinstance(raw, str) else raw
-        if isinstance(data, dict):
-            for family in RULE_FAMILIES:
-                val = data.get(family, 0)
-                if isinstance(val, (list, dict)):
-                    val = len(val)
-                counts[family] = float(val or 0)
-    except (TypeError, ValueError):
-        log.warning("could not parse %s", COL_ERRORS)
-    return counts
-
-
-class PipelineCollector:
-    def collect(self):
-        up = GaugeMetricFamily("pipeline_db_up", "Exporter can reach PostgreSQL")
-        try:
-            conn = _connect()
-        except Exception:
-            log.exception("database unreachable")
-            up.add_metric([], 0)
-            yield up
-            return
-
-        try:
-            with conn, conn.cursor() as cur:
-                yield from self._collect(cur)
-            up.add_metric([], 1)
-        except Exception:
-            log.exception("query failed")
-            up.add_metric([], 0)
-        finally:
-            conn.close()
-        yield up
-
-    def _collect(self, cur):
-        # 1) runs by status
-        runs = GaugeMetricFamily(
-            "pipeline_runs_total", "Runs by status", labels=["dag_id", "status"]
-        )
-        cur.execute(f"SELECT {COL_STATUS}, COUNT(*) FROM {TABLE} GROUP BY {COL_STATUS}")
-        seen = dict(cur.fetchall())
-        for status in sorted(set(STATUSES) | set(seen)):
-            runs.add_metric([DAG_ID, status], float(seen.get(status, 0)))
-        yield runs
-
-        # 2) record counters across all runs
-        cur.execute(
-            f"SELECT COALESCE(SUM({COL_EXTRACTED}),0), COALESCE(SUM({COL_LOADED}),0),"
-            f" COALESCE(SUM({COL_REJECTED}),0) FROM {TABLE}"
-        )
-        extracted, loaded, rejected = cur.fetchone()
-        for name, doc, val in (
-            (
-                "pipeline_records_processed_total",
-                "Extracted rows across runs",
-                extracted,
-            ),
-            ("pipeline_records_loaded_total", "Loaded rows across runs", loaded),
-            (
-                "pipeline_records_rejected_total",
-                "Quarantined rows across runs",
-                rejected,
-            ),
-        ):
-            g = GaugeMetricFamily(name, doc)
-            g.add_metric([], float(val))
-            yield g
-
-        # 3) timestamps
-        cur.execute(
-            f"SELECT COALESCE(EXTRACT(EPOCH FROM MAX({COL_FINISHED})) FILTER "
-            f"(WHERE {COL_STATUS}='SUCCESS'), 0), "
-            "COALESCE(EXTRACT(EPOCH FROM MAX("
-            f"COALESCE({COL_FINISHED},{COL_STARTED}))), 0) "
-            f"FROM {TABLE}"
-        )
-        last_success, last_reported = cur.fetchone()
-        g = GaugeMetricFamily(
-            "pipeline_last_success_timestamp_seconds", "Finish time of latest success"
-        )
-        g.add_metric([], float(last_success))
-        yield g
-        g = GaugeMetricFamily(
-            "pipeline_last_reported_timestamp_seconds", "Time of latest run report"
-        )
-        g.add_metric([], float(last_reported))
-        yield g
-
-        # 4) latest run
-        cur.execute(
-            f"SELECT {COL_STATUS}, COALESCE({COL_REJ_RATE},0), {COL_ERRORS}, "
-            f"COALESCE(EXTRACT(EPOCH FROM ({COL_FINISHED} - {COL_STARTED})), 0) "
-            f"FROM {TABLE} ORDER BY {COL_STARTED} DESC LIMIT 1"
-        )
-        row = cur.fetchone()
-        status, rej_rate, errors, duration = row if row else (None, 0, None, 0)
-
-        g = GaugeMetricFamily(
-            "pipeline_last_run_status", "Latest run status (one-hot)", labels=["status"]
-        )
-        for s in STATUSES:
-            g.add_metric([s], 1.0 if status == s else 0.0)
-        yield g
-
-        g = GaugeMetricFamily("pipeline_rejection_rate", "Latest rejection fraction")
-        g.add_metric([], float(rej_rate))
-        yield g
-
-        g = GaugeMetricFamily(
-            "pipeline_last_run_duration_seconds", "Latest run duration in seconds"
-        )
-        g.add_metric([], float(duration))
-        yield g
-
-        g = GaugeMetricFamily(
-            "pipeline_dq_failures_total",
-            "Latest-run failures by rule family",
-            labels=["rule_family"],
-        )
-        for family, count in _family_counts(errors).items():
-            g.add_metric([family], count)
-        yield g
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
 
 
-def emit_run_metrics(run_id: str | None = None, *args, **kwargs) -> dict:
-    """Hook called by the DAG's ``emit_metrics`` task.
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
 
-    The exporter is DB-backed: every metric is derived from
-    observability.pipeline_runs on scrape, so there is nothing to push here.
-    This logs a snapshot of the run so the Airflow task log shows what
-    Prometheus will report. It never raises, so telemetry cannot fail a run.
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
     """
-    snapshot: dict = {"run_id": run_id, "status": None, "found": False}
+
     try:
-        conn = _connect()
-        try:
-            with conn, conn.cursor() as cur:
-                if run_id:
-                    cur.execute(
-                        f"SELECT {COL_STATUS}, {COL_REJ_RATE} FROM {TABLE} "
-                        "WHERE run_id = %s",
-                        (str(run_id),),
-                    )
-                else:
-                    cur.execute(
-                        f"SELECT {COL_STATUS}, {COL_REJ_RATE} FROM {TABLE} "
-                        f"ORDER BY {COL_STARTED} DESC LIMIT 1"
-                    )
-                row = cur.fetchone()
-                if row:
-                    snapshot.update(
-                        found=True, status=row[0], rejection_rate=float(row[1] or 0)
-                    )
-        finally:
-            conn.close()
-    except Exception:
-        log.exception("emit_run_metrics could not read run state")
-    log.info("emit_run_metrics snapshot: %s", snapshot)
-    return snapshot
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    REGISTRY.register(PipelineCollector())
-    start_http_server(PORT)
-    log.info("ObsiFlow exporter listening on :%d", PORT)
-    while True:
-        time.sleep(3600)
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    main()"""Single-source Prometheus metrics emitter for the ObsiFlow platform.
+
+The exporter intentionally derives every value from PostgreSQL.  Airflow workers
+may be restarted at any time, so in-process counters would reset and silently
+lie.  ``pipeline_runs`` is the source of truth; this module projects it into the
+Prometheus registry served on ``OBSIFLOW_METRICS_PORT``.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from prometheus_client import CollectorRegistry, Gauge, generate_latest, start_http_server
+
+from config.settings import Settings, get_settings
+from etl.contracts import ALL_RULE_FAMILIES
+from etl.load import fetch_metrics_snapshots
+
+logger = logging.getLogger(__name__)
+
+REGISTRY = CollectorRegistry()
+
+RUNS_TOTAL = Gauge(
+    "pipeline_runs_total",
+    "Pipeline runs recorded in PostgreSQL, grouped by terminal status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+RUNS_IN_FLIGHT = Gauge(
+    "pipeline_runs_in_flight",
+    "Pipeline runs currently in RUNNING state.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_PROCESSED = Gauge(
+    "pipeline_records_processed_total",
+    "Total extracted records across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_LOADED = Gauge(
+    "pipeline_records_loaded_total",
+    "Total records upserted into the target table across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RECORDS_REJECTED = Gauge(
+    "pipeline_records_rejected_total",
+    "Total records quarantined across all runs.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DQ_FAILURES = Gauge(
+    "pipeline_dq_failures_total",
+    "Data-quality failures in the most recent run, by rule family.",
+    ["dag_id", "rule_family"],
+    registry=REGISTRY,
+)
+LAST_SUCCESS = Gauge(
+    "pipeline_last_success_timestamp_seconds",
+    "Unix timestamp of the most recent successful run (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_REPORTED = Gauge(
+    "pipeline_last_reported_timestamp_seconds",
+    "Unix timestamp of the most recent run report of any status (0 if none).",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+LAST_RUN_STATUS = Gauge(
+    "pipeline_last_run_status",
+    "One-hot indicator of the most recent run status.",
+    ["dag_id", "status"],
+    registry=REGISTRY,
+)
+REJECTION_RATE = Gauge(
+    "pipeline_rejection_rate",
+    "Rejected fraction of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+RUN_DURATION = Gauge(
+    "pipeline_last_run_duration_seconds",
+    "Wall-clock duration of the most recent run.",
+    ["dag_id"],
+    registry=REGISTRY,
+)
+DB_UP = Gauge(
+    "pipeline_db_up",
+    "1 when the exporter can read PostgreSQL, 0 otherwise.",
+    registry=REGISTRY,
+)
+EXPORTER_REFRESH = Gauge(
+    "pipeline_exporter_last_refresh_timestamp_seconds",
+    "Unix timestamp of the last successful exporter refresh.",
+    registry=REGISTRY,
+)
+
+_LABELLED_GAUGES = (
+    RUNS_TOTAL,
+    RUNS_IN_FLIGHT,
+    RECORDS_PROCESSED,
+    RECORDS_LOADED,
+    RECORDS_REJECTED,
+    DQ_FAILURES,
+    LAST_SUCCESS,
+    LAST_REPORTED,
+    LAST_RUN_STATUS,
+    REJECTION_RATE,
+    RUN_DURATION,
+)
+
+
+def _epoch(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _as_dict(row: dict[str, Any], key: str) -> dict[str, int]:
+    raw = row.get(key) or {}
+    return {str(name): int(count) for name, count in raw.items()}
+
+
+def _publish_snapshot(snapshot: dict[str, Any]) -> None:
+    dag_id = str(snapshot["dag_id"])
+
+    RUNS_TOTAL.labels(dag_id, "success").set(int(snapshot.get("success_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "failed").set(int(snapshot.get("failed_runs") or 0))
+    RUNS_TOTAL.labels(dag_id, "running").set(int(snapshot.get("running_runs") or 0))
+    RUNS_IN_FLIGHT.labels(dag_id).set(int(snapshot.get("running_runs") or 0))
+
+    RECORDS_PROCESSED.labels(dag_id).set(float(snapshot.get("extracted_total") or 0))
+    RECORDS_LOADED.labels(dag_id).set(float(snapshot.get("loaded_total") or 0))
+    RECORDS_REJECTED.labels(dag_id).set(float(snapshot.get("rejected_total") or 0))
+
+    LAST_SUCCESS.labels(dag_id).set(_epoch(snapshot.get("last_success_at")))
+    LAST_REPORTED.labels(dag_id).set(_epoch(snapshot.get("last_reported_at")))
+
+    latest_status = str(snapshot.get("latest_status") or "").upper()
+    for status in ("success", "failed", "running"):
+        LAST_RUN_STATUS.labels(dag_id, status).set(1.0 if latest_status == status.upper() else 0.0)
+
+    REJECTION_RATE.labels(dag_id).set(float(snapshot.get("latest_rejection_rate") or 0.0))
+    RUN_DURATION.labels(dag_id).set(float(snapshot.get("latest_duration_seconds") or 0.0))
+
+    failures = _as_dict(snapshot, "latest_failures_by_rule")
+    for family in ALL_RULE_FAMILIES:
+        DQ_FAILURES.labels(dag_id, family.value).set(float(failures.get(family.value, 0)))
+
+
+def refresh_metrics_from_db(settings: Settings | None = None) -> bool:
+    """Refresh every gauge from PostgreSQL.
+
+    Returns:
+        ``True`` when the database was reachable, ``False`` otherwise.  A failed
+        refresh never raises: the exporter must stay alive to report ``db_up=0``.
+    """
+
+    try:
+        snapshots = fetch_metrics_snapshots(settings=settings)
+    except Exception as exc:
+        DB_UP.set(0)
+        logger.warning("Metrics refresh failed; PostgreSQL is unreachable: %s", exc)
+        return False
+
+    for gauge in _LABELLED_GAUGES:
+        gauge.clear()
+    for snapshot in snapshots:
+        _publish_snapshot(snapshot)
+
+    DB_UP.set(1)
+    EXPORTER_REFRESH.set(time.time())
+    logger.debug("Refreshed metrics for %d DAG(s)", len(snapshots))
+    return True
+
+
+def emit_run_metrics(run_id: str | None = None, settings: Settings | None = None) -> bool:
+    """DAG-friendly entry point that refreshes DB-backed metrics.
+
+    ``run_id`` is accepted for call-site symmetry and logging; the database is
+    always the source of truth.
+    """
+
+    logger.info("Emitting telemetry for run %s", run_id or "<all>")
+    return refresh_metrics_from_db(settings=settings)
+
+
+def render_metrics() -> str:
+    """Return the Prometheus text exposition (used by tests and diagnostics)."""
+
+    return generate_latest(REGISTRY).decode("utf-8")
+
+
+def main() -> None:
+    """Run the long-lived exporter endpoint."""
+
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    start_http_server(settings.metrics_port, registry=REGISTRY)
+    logger.info("Prometheus exporter listening on :%d", settings.metrics_port)
+
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop_event.is_set():
+        refresh_metrics_from_db(settings)
+        stop_event.wait(settings.metrics_refresh_interval_seconds)
+
+    logger.info("Prometheus exporter stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
     main()
