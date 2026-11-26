@@ -1,43 +1,20 @@
-# ObsiFlow alerting rules.
-groups:
-  - name: obsiflow-pipeline
-    rules:
-      - alert: PipelineRunFailed
-        expr: pipeline_last_run_status{status="failed"} == 1
-        for: 0m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Latest ObsiFlow pipeline run failed"
-          description: "Check observability.pipeline_runs and quality.error_records. See docs/runbook.md."
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    platform: obsiflow
 
-      - alert: PipelineStale
-        expr: |
-          pipeline_last_success_timestamp_seconds > 0
-          and (time() - pipeline_last_success_timestamp_seconds) > 26 * 3600
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "No successful pipeline run in more than 26 hours"
-          description: "Daily schedule plus 2h grace has been exceeded."
+rule_files:
+  - /etc/prometheus/alert_rules.yml
 
-      - alert: PipelineNeverReported
-        expr: |
-          absent(pipeline_last_reported_timestamp_seconds)
-          or pipeline_last_reported_timestamp_seconds == 0
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Pipeline telemetry has never been reported"
-          description: "observability.pipeline_runs is empty or the exporter is down."
+scrape_configs:
+  - job_name: obsiflow-telemetry
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - metrics-exporter:9101
 
-      - alert: HighRejectionRate
-        expr: pipeline_rejection_rate > 0.10
-        for: 0m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Latest run rejected more than 10% of extracted rows"
-          description: "Rejection rate is {{ $value | humanizePercentage }}."
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
