@@ -31,6 +31,7 @@ class ExtractResult:
     error_kind: str | None = None
     fatal: bool = False
 
+
 def extract_batch(source_path: str | Path) -> ExtractResult:
     path = Path(source_path)
     source_str = str(path)
