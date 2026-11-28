@@ -4,8 +4,8 @@
 
 * OR-01/02  DAG + execution order:
             ``begin_run >> extract >> validate >> load >> emit_metrics >> done``
-* OR-03     Retries: transient errors (``TransientPipelineError``, DB/network) use the
-            exponential-backoff policy in ``default_args``.
+* OR-03     Retries: transient (``TransientPipelineError``) and unclassified errors use
+            the exponential-backoff policy in ``default_args``; permanent errors do not.
 * OR-04     Failed-task handling: ``PermanentPipelineError`` is translated into
             ``AirflowFailException`` (no retries) and ``_on_failure`` marks the run FAILED.
 * OR-05     Dead-letter routing: the validate task delegates to the DE/DQ stage that
@@ -31,7 +31,7 @@ from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator
 
 from config.settings import get_settings
-from etl.contracts import PermanentPipelineError, TransientPipelineError
+from etl.contracts import PermanentPipelineError
 from etl.extract import extract_batch
 from etl.pipeline import (
     begin_run_stage,
@@ -94,6 +94,16 @@ def _has_retry_attempt_left(context: dict[str, Any]) -> bool:
         return False
 
 
+def _is_retryable_failure(exception: BaseException | None) -> bool:
+    """True when Airflow may retry the failed attempt (OR-03).
+
+    Transient errors and unclassified bugs follow the default retry policy;
+    permanent errors and already fail-fast-converted failures are terminal.
+    """
+
+    return not isinstance(exception, PermanentPipelineError | AirflowFailException)
+
+
 # ---------------------------------------------------------------------------
 # Task callables
 # ---------------------------------------------------------------------------
@@ -113,7 +123,7 @@ def _extract(**context: Any) -> dict[str, Any]:
     """Pre-flight read of the batch. Returns counts only, never the dataframe."""
 
     metadata = _run_metadata(context)
-    result = extract_batch(metadata["source_file"])
+    result = fail_fast(extract_batch, metadata["source_file"])
     if result.fatal:
         # Missing/unreadable file will not fix itself on retry.
         raise AirflowFailException(f"Extraction failed ({result.error_kind}): {result.error}")
@@ -145,6 +155,8 @@ def _load(**context: Any) -> dict[str, Any]:
 
     run_id = str(_run_metadata(context)["run_id"])
     load_summary = fail_fast(transform_and_load_stage, run_id, settings=settings)
+    # The upsert is durable now, so mark SUCCESS before the best-effort metrics
+    # step; a metrics hiccup must not leave the audit row stuck on RUNNING.
     final_run = fail_fast(finalize_run_stage, run_id, settings=settings)
     return {"run_id": run_id, "load": load_summary, "status": final_run.get("status")}
 
@@ -161,14 +173,14 @@ def _emit_metrics(**context: Any) -> bool:
 
 
 def _on_failure(context: dict[str, Any]) -> None:
-    """OR-04: mark the run FAILED, unless a transient error still has retries left."""
+    """OR-04: mark the run FAILED, unless Airflow still has retries left."""
 
     logger.error("Task failure callback invoked for %s", context.get("task_instance_key_str"))
     exception = context.get("exception")
 
-    if isinstance(exception, TransientPipelineError) and _has_retry_attempt_left(context):
+    if _is_retryable_failure(exception) and _has_retry_attempt_left(context):
         logger.warning(
-            "Transient failure on attempt %s/%s; leaving run RUNNING for Airflow to retry",
+            "Retryable failure on attempt %s/%s; leaving run RUNNING for Airflow to retry",
             getattr(context.get("task_instance"), "try_number", "?"),
             getattr(context.get("task_instance"), "max_tries", "?"),
         )
