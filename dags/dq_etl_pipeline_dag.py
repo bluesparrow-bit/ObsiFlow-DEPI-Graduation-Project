@@ -1,14 +1,21 @@
-"""Thin Airflow DAG skeleton: wiring only, no dataframes and no SQL.
+"""Thin Airflow DAG: orchestration wiring only, no dataframes and no SQL.
 
-[OR] Keep orchestration concerns here and delegate business work to the role
-owners.  The logical chain is ``extract >> validate >> load >> emit_metrics``
-wrapped by audit/finalization tasks.
+[OR] Owns OR-01..OR-06:
 
-TODO [OR]:
-* Persist RUNNING/SUCCESS/FAILED rows in ``observability.pipeline_runs``.
-* Decide retry policy per task and translate permanent failures with
-  ``AirflowFailException`` so doomed batches are not retried.
-* Pass only small, serializable metadata through XCom; never dataframes.
+* OR-01/02  DAG + execution order:
+            ``begin_run >> extract >> validate >> load >> emit_metrics >> done``
+* OR-03     Retries: transient (``TransientPipelineError``) and unclassified errors use
+            the exponential-backoff policy in ``default_args``; permanent errors do not.
+* OR-04     Failed-task handling: ``PermanentPipelineError`` is translated into
+            ``AirflowFailException`` (no retries) and ``_on_failure`` marks the run FAILED.
+* OR-05     Dead-letter routing: the validate task delegates to the DE/DQ stage that
+            writes rejected rows to ``quality.error_records`` *before* a blocking
+            violation fails the run.
+* OR-06     Execution logging: RUNNING row on ``begin_run``, SUCCESS after ``load``,
+            FAILED from the failure callback (``observability.pipeline_runs``).
+
+Business work lives in ``etl.pipeline`` / ``etl.extract`` / ``monitoring.metrics``.
+Only small JSON-serializable metadata crosses XCom.
 """
 
 from __future__ import annotations
@@ -26,6 +33,13 @@ from airflow.operators.python import PythonOperator
 from config.settings import get_settings
 from etl.contracts import PermanentPipelineError
 from etl.extract import extract_batch
+from etl.pipeline import (
+    begin_run_stage,
+    extract_and_validate_stage,
+    finalize_run_stage,
+    mark_run_failed_stage,
+    transform_and_load_stage,
+)
 from monitoring.metrics import emit_run_metrics
 
 logger = logging.getLogger(__name__)
@@ -36,8 +50,11 @@ DAG_ID = settings.pipeline_dag_id
 START_DATE = datetime(2024, 1, 1, tzinfo=UTC)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def fail_fast(task_callable: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-    """Run a stage, converting terminal errors into non-retryable Airflow failures."""
+    """Run a stage, converting terminal errors into non-retryable Airflow failures (OR-03/04)."""
 
     try:
         return task_callable(*args, **kwargs)
@@ -46,46 +63,154 @@ def fail_fast(task_callable: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         raise AirflowFailException(str(exc)) from exc
 
 
-def _begin_run(**context: dict[str, Any]) -> dict[str, Any]:
-    """Create the run audit row before any business stage executes."""
+def _source_from_context(context: dict[str, Any]) -> str:
+    """Read ``source_file`` from the DAG run conf (needed for the OR-07 demo).
 
-    # TODO [OR]: Insert a RUNNING row and return {"run_id", "source_file"}.
-    raise NotImplementedError("TODO [OR]: Implement DB run logging")
+    Example conf: ``{"source_file": "data/sample_corrupted.csv"}``.
+    """
 
-
-def _extract(**context: dict[str, Any]) -> Any:
-    """Read the batch as raw strings via the DE extraction interface."""
-
-    return extract_batch(settings.sample_valid_file)
-
-
-def _validate(**context: dict[str, Any]) -> dict[str, Any]:
-    """Run the six DQ rule families and stage the valid/invalid split."""
-
-    # TODO [DQ]: Call validation.engine.validate_batch and persist quarantine.
-    raise NotImplementedError("TODO [DQ]: Implement the validation stage")
+    dag_run = context.get("dag_run")
+    conf = getattr(dag_run, "conf", None) or {}
+    configured = conf.get("source_file") if isinstance(conf, dict) else None
+    return str(configured or settings.sample_valid_file)
 
 
-def _load(**context: dict[str, Any]) -> dict[str, Any]:
-    """Transform staged records and idempotently upsert them into PostgreSQL."""
+def _run_metadata(context: dict[str, Any]) -> dict[str, Any]:
+    """Read the small metadata dict that ``begin_run`` pushed to XCom."""
 
-    # TODO [DE]: Read staging artefacts, transform, and call etl.load.load_transactions.
-    raise NotImplementedError("TODO [DE]: Implement the load stage")
+    metadata = context["ti"].xcom_pull(task_ids="begin_run") or {}
+    if not metadata.get("run_id"):
+        raise PermanentPipelineError("begin_run did not publish a run_id")
+    return metadata
 
 
-def _emit_metrics(**context: dict[str, Any]) -> bool:
-    """Ask the observability exporter to refresh its DB-backed snapshot."""
+def _has_retry_attempt_left(context: dict[str, Any]) -> bool:
+    """True when Airflow will retry this task instance again."""
 
-    return emit_run_metrics(str(context.get("run_id") or ""), settings=settings)
+    task_instance = context.get("task_instance")
+    try:
+        return int(task_instance.try_number) < int(task_instance.max_tries)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _is_retryable_failure(exception: BaseException | None) -> bool:
+    """True when Airflow may retry the failed attempt (OR-03).
+
+    Transient errors and unclassified bugs follow the default retry policy;
+    permanent errors and already fail-fast-converted failures are terminal.
+    """
+
+    return not isinstance(exception, PermanentPipelineError | AirflowFailException)
+
+
+# ---------------------------------------------------------------------------
+# Task callables
+# ---------------------------------------------------------------------------
+def _begin_run(**context: Any) -> dict[str, Any]:
+    """OR-06: insert the RUNNING audit row and publish {run_id, source_file, batch_id}."""
+
+    return fail_fast(
+        begin_run_stage,
+        str(context["run_id"]),
+        _source_from_context(context),
+        DAG_ID,
+        settings=settings,
+    )
+
+
+def _extract(**context: Any) -> dict[str, Any]:
+    """Pre-flight read of the batch. Returns counts only, never the dataframe."""
+
+    metadata = _run_metadata(context)
+    result = fail_fast(extract_batch, metadata["source_file"])
+    if result.fatal:
+        # Missing/unreadable file will not fix itself on retry.
+        raise AirflowFailException(f"Extraction failed ({result.error_kind}): {result.error}")
+    return {
+        "run_id": metadata["run_id"],
+        "row_count": int(result.row_count),
+        "is_empty": bool(result.is_empty),
+    }
+
+
+def _validate(**context: Any) -> dict[str, Any]:
+    """OR-05: validate, route rejected rows to quality.error_records, stage valid rows.
+
+    Blocking violations (missing columns, row-count bounds) raise
+    PermanentPipelineError *after* quarantine is persisted -> AirflowFailException.
+    """
+
+    metadata = _run_metadata(context)
+    return fail_fast(
+        extract_and_validate_stage,
+        str(metadata["run_id"]),
+        str(metadata["source_file"]),
+        settings=settings,
+    )
+
+
+def _load(**context: Any) -> dict[str, Any]:
+    """Transform + idempotent upsert, then mark the run SUCCESS (OR-06)."""
+
+    run_id = str(_run_metadata(context)["run_id"])
+    load_summary = fail_fast(transform_and_load_stage, run_id, settings=settings)
+    # The upsert is durable now, so mark SUCCESS before the best-effort metrics
+    # step; a metrics hiccup must not leave the audit row stuck on RUNNING.
+    final_run = fail_fast(finalize_run_stage, run_id, settings=settings)
+    return {"run_id": run_id, "load": load_summary, "status": final_run.get("status")}
+
+
+def _emit_metrics(**context: Any) -> bool:
+    """Best effort: the exporter also polls PostgreSQL, so this never fails the run."""
+
+    try:
+        run_id = str(_run_metadata(context)["run_id"])
+        return bool(emit_run_metrics(run_id, settings=settings))
+    except Exception as exc:  # telemetry must not gate the pipeline
+        logger.warning("Metric refresh failed (non-blocking): %s", exc)
+        return False
 
 
 def _on_failure(context: dict[str, Any]) -> None:
-    """Failure callback placeholder for audit finalization."""
+    """OR-04: mark the run FAILED, unless Airflow still has retries left."""
 
     logger.error("Task failure callback invoked for %s", context.get("task_instance_key_str"))
-    # TODO [OR]: Mark the run FAILED unless a retry attempt remains.
-    logger.warning("TODO [OR]: pipeline_runs failure finalization is not implemented yet")
+    exception = context.get("exception")
 
+    if _is_retryable_failure(exception) and _has_retry_attempt_left(context):
+        logger.warning(
+            "Retryable failure on attempt %s/%s; leaving run RUNNING for Airflow to retry",
+            getattr(context.get("task_instance"), "try_number", "?"),
+            getattr(context.get("task_instance"), "max_tries", "?"),
+        )
+        return
+
+    try:
+        run_id = str(_run_metadata(context)["run_id"])
+    except Exception:  # begin_run itself may have failed
+        logger.warning("No run id available in failure context; skipping run finalization")
+        return
+
+    mark_run_failed_stage(run_id, exception or "Unknown task failure", settings=settings)
+
+
+# ---------------------------------------------------------------------------
+# DAG
+# ---------------------------------------------------------------------------
+default_args = {
+    "owner": "obsiflow",
+    "depends_on_past": False,
+    "email_on_failure": False,
+    # OR-03: 3 retries, 2 min -> 4 -> 8 ... capped at 30 min (transient errors only;
+    # permanent ones are short-circuited by fail_fast/AirflowFailException).
+    "retries": settings.pipeline_max_retries,
+    "retry_delay": timedelta(seconds=settings.pipeline_retry_delay_seconds),
+    "retry_exponential_backoff": True,
+    "max_retry_delay": timedelta(minutes=30),
+    "execution_timeout": timedelta(minutes=30),
+    "on_failure_callback": _on_failure,
+}
 
 with DAG(
     dag_id=DAG_ID,
@@ -95,37 +220,27 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     dagrun_timeout=timedelta(hours=2),
-    default_args={
-        "owner": "obsiflow",
-        "depends_on_past": False,
-        "email_on_failure": False,
-        # TODO [OR]: Tune retries/backoff per failure class.
-        "retries": settings.pipeline_max_retries,
-        "retry_delay": timedelta(seconds=settings.pipeline_retry_delay_seconds),
-        "retry_exponential_backoff": True,
-        "max_retry_delay": timedelta(minutes=30),
-        "on_failure_callback": _on_failure,
-    },
+    default_args=default_args,
     tags=["dq", "etl", "observability", "daily"],
     params={"source_file": str(settings.sample_valid_file)},
     doc_md="""
-# ObsiFlow DQ/ETL Pipeline (Skeleton)
-
-Logical chain:
+# ObsiFlow DQ/ETL Pipeline
 
 `begin_run >> extract >> validate >> load >> emit_metrics >> done`
 
-The former `extract_and_validate` step is split into explicit `extract` and
-`validate` tasks so [DE] and [DQ] can work independently.
+(The former `extract_and_validate` step is split into explicit `extract` and
+`validate` tasks so [DE] and [DQ] can work independently.)
 
-- [OR] owns task wiring, retries, failure callbacks, and run audit logging.
-- [DE] owns extraction, transformation, and loading.
-- [DQ] owns validation and quarantine.
-- [OB] owns exporter refresh and alerting.
+1. **begin_run** - insert RUNNING row in `observability.pipeline_runs`.
+2. **extract** - pre-flight read; missing/unreadable file fails permanently.
+3. **validate** - six DQ rule families; rejected rows -> `quality.error_records`.
+4. **load** - transform + idempotent upsert, then mark the run SUCCESS.
+5. **emit_metrics** - best-effort exporter refresh (never gates the run).
 
-Permanent validation failures should raise `AirflowFailException` (no retries);
-transient database/network errors should use exponential-backoff retries.
-Override the batch per run with `{"source_file": "data/sample_corrupted.csv"}`.
+Permanent failures raise `AirflowFailException` (no retries); transient
+database/network errors retry with exponential backoff; the failure callback
+marks the run FAILED. Override the batch with
+`{"source_file": "data/sample_corrupted.csv"}` in the DAG run conf.
 """,
 ) as dag:
     begin_run = PythonOperator(task_id="begin_run", python_callable=_begin_run)

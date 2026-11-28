@@ -1,8 +1,9 @@
 """Airflow-independent pipeline stage service interface.
 
-[DE] + [OR] Implement these stages.  Each stage must persist enough state (run
-row, quarantine rows, staging JSON) that a retry is safe and no dataframe ever
-crosses an XCom boundary.
+[DE] + [OR] Implement these stages.  [OR] owns begin_run_stage,
+finalize_run_stage and mark_run_failed_stage (run audit logging, OR-06).
+Each stage must persist enough state (run row, quarantine rows, staging JSON)
+that a retry is safe and no dataframe ever crosses an XCom boundary.
 """
 
 from __future__ import annotations
@@ -12,10 +13,17 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from config.settings import DQConfig, Settings
-from etl.contracts import PipelineRun
+from config.settings import DQConfig, Settings, get_settings
+from etl.contracts import PermanentPipelineError, PipelineRun
+from etl.load import fetch_pipeline_run, finish_pipeline_run, start_pipeline_run
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate(value: str, limit: int = 2000) -> str:
+    """Keep error summaries small enough for the audit table and dashboards."""
+
+    return value if len(value) <= limit else value[: limit - 3] + "..."
 
 
 def begin_run_stage(
@@ -25,12 +33,26 @@ def begin_run_stage(
     *,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
-    """Create the audit row and return serializable run metadata.
+    """[OR-06] Create the RUNNING audit row and return serializable run metadata."""
 
-    TODO [DE]: insert the RUNNING row through ``etl.load.start_pipeline_run``.
-    """
-
-    raise NotImplementedError("TODO [DE]: Implement this function")
+    resolved = settings or get_settings()
+    resolved.ensure_runtime_directories()
+    resolved_dag_id = dag_id or resolved.pipeline_dag_id
+    source = Path(source_file)
+    batch_id = source.stem
+    start_pipeline_run(
+        run_id=run_id,
+        dag_id=resolved_dag_id,
+        source_file=str(source),
+        batch_id=batch_id,
+        settings=resolved,
+    )
+    return {
+        "run_id": run_id,
+        "dag_id": resolved_dag_id,
+        "source_file": str(source),
+        "batch_id": batch_id,
+    }
 
 
 def extract_and_validate_stage(
@@ -64,9 +86,14 @@ def finalize_run_stage(
     *,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
-    """Mark a run SUCCESS and return its final persisted contract."""
+    """[OR-06] Mark a run SUCCESS and return its final persisted contract."""
 
-    raise NotImplementedError("TODO [DE]: Implement this function")
+    resolved = settings or get_settings()
+    finish_pipeline_run(run_id, "SUCCESS", settings=resolved)
+    run = fetch_pipeline_run(run_id, settings=resolved)
+    if run is None:
+        raise PermanentPipelineError(f"Run disappeared during finalization: {run_id}")
+    return run.model_dump(mode="json")
 
 
 def mark_run_failed_stage(
@@ -75,9 +102,18 @@ def mark_run_failed_stage(
     *,
     settings: Settings | None = None,
 ) -> None:
-    """Best-effort failure finalization used by Airflow callbacks and the CLI."""
+    """[OR-04/06] Best-effort failure finalization used by Airflow callbacks and the CLI.
 
-    raise NotImplementedError("TODO [DE]: Implement this function")
+    A database outage here is logged, not raised: re-raising would hide the
+    original root-cause exception.
+    """
+
+    resolved = settings or get_settings()
+    message = _truncate(str(error) or error.__class__.__name__)
+    try:
+        finish_pipeline_run(run_id, "FAILED", error_summary=message, settings=resolved)
+    except Exception as exc:  # never hide the original failure
+        logger.error("Could not mark run %s as FAILED: %s", run_id, exc)
 
 
 def run_pipeline(

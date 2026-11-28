@@ -16,7 +16,7 @@ from airflow.exceptions import AirflowFailException
 from dags.dq_etl_pipeline_dag import _on_failure, fail_fast
 from etl.contracts import PermanentPipelineError, TransientPipelineError
 
-pytestmark = [pytest.mark.integration, pytest.mark.skip(reason="Pending role implementation")]
+pytestmark = [pytest.mark.integration]
 
 T = TypeVar("T")
 
@@ -122,3 +122,47 @@ def test_failure_callback_marks_transient_failure_on_last_attempt() -> None:
 
     mark_failed.assert_called_once()
     assert "database restarting" in str(mark_failed.call_args.args[1])
+
+
+def test_failure_callback_defers_unclassified_failure_while_retries_remain() -> None:
+    xcom = Mock(return_value={"run_id": "run-123"})
+    context = {
+        "ti": SimpleNamespace(xcom_pull=xcom),
+        "task_instance": SimpleNamespace(try_number=1, max_tries=4),
+        "exception": ValueError("unexpected bug"),
+    }
+
+    with patch("dags.dq_etl_pipeline_dag.mark_run_failed_stage") as mark_failed:
+        _on_failure(context)
+
+    mark_failed.assert_not_called()
+
+
+def test_failure_callback_marks_unclassified_failure_on_last_attempt() -> None:
+    xcom = Mock(return_value={"run_id": "run-123"})
+    context = {
+        "ti": SimpleNamespace(xcom_pull=xcom),
+        "task_instance": SimpleNamespace(try_number=4, max_tries=4),
+        "exception": ValueError("unexpected bug"),
+    }
+
+    with patch("dags.dq_etl_pipeline_dag.mark_run_failed_stage") as mark_failed:
+        _on_failure(context)
+
+    mark_failed.assert_called_once()
+    assert "unexpected bug" in str(mark_failed.call_args.args[1])
+
+
+def test_failure_callback_marks_permanent_failure_immediately() -> None:
+    xcom = Mock(return_value={"run_id": "run-123"})
+    context = {
+        "ti": SimpleNamespace(xcom_pull=xcom),
+        "task_instance": SimpleNamespace(try_number=1, max_tries=4),
+        "exception": AirflowFailException("missing required column"),
+    }
+
+    with patch("dags.dq_etl_pipeline_dag.mark_run_failed_stage") as mark_failed:
+        _on_failure(context)
+
+    mark_failed.assert_called_once()
+    assert "missing required column" in str(mark_failed.call_args.args[1])

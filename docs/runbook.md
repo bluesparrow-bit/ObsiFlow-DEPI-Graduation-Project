@@ -263,7 +263,30 @@ python -m etl.pipeline --source data/sample_corrupted.csv --no-metrics
 The CLI uses the same stages and persistence as the DAG. It exits non-zero on a
 permanent/transient pipeline error and always attempts to finalize the run.
 
-## 8. Ownership and escalation
+## 8. Orchestration retry and failure policy
+
+Owner: `OR`. Task chain: `begin_run >> extract >> validate >> load >> emit_metrics >> done`.
+
+| Failure class | Example | Airflow behaviour | `pipeline_runs.status` |
+|---|---|---|---|
+| Transient (`TransientPipelineError`) | PostgreSQL restart, connection reset | Retried up to 3 times: 2 min, 4 min, 8 min (exponential backoff, capped at 30 min) | Stays `RUNNING` while retries remain, then `FAILED` |
+| Permanent (`PermanentPipelineError`) | Missing column, row count out of bounds, missing source file | Raised as `AirflowFailException`: no retries | `FAILED` immediately, with `error_summary` |
+| Unclassified exception | Unexpected bug | Retried like a transient error (safe default) | `FAILED` once retries are exhausted |
+| Metric refresh failure (`emit_metrics`) | Exporter unreachable | Logged as a warning; never fails the run | Unchanged (`SUCCESS`) |
+
+Run audit logging:
+
+- `begin_run` inserts the `RUNNING` row (`etl.pipeline.begin_run_stage`).
+- `load` marks the run `SUCCESS` after the upsert (`finalize_run_stage`).
+- The DAG failure callback marks the run `FAILED` (`mark_run_failed_stage`). If the
+  database is down at that moment the callback logs the problem instead of raising,
+  so the original root cause stays visible in the task log.
+
+Each task has a 30-minute `execution_timeout`; the whole run has a 2-hour
+`dagrun_timeout`. Only small JSON metadata (`run_id`, `source_file`, counts) crosses
+XCom; valid rows are staged under `data/staging/<run_id>/`.
+
+## 9. Ownership and escalation
 
 | Area | Primary | Escalation |
 |---|---|---|
