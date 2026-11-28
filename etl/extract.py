@@ -33,15 +33,58 @@ class ExtractResult:
 
 
 def extract_batch(source_path: str | Path) -> ExtractResult:
-    """Read a CSV batch as raw strings.
+    path = Path(source_path)
+    source_str = str(path)
 
-    Args:
-        source_path: CSV file to ingest.
+    if not path.exists() or not path.is_file():
+        return ExtractResult(
+            source_file=source_str,
+            error=f"File not found: {source_str}",
+            error_kind="missing_file",
+            fatal=True,
+        )
 
-    Returns:
-        An :class:`ExtractResult`.  Missing files, unreadable bytes, and parser
-        failures return ``fatal=True`` with a diagnostic; zero-row and header-only
-        files return ``is_empty=True`` with no exception.
-    """
+    if path.stat().st_size == 0:
+        return ExtractResult(
+            source_file=source_str,
+            is_empty=True,
+            fatal=False,
+        )
 
-    raise NotImplementedError("TODO [DE]: Implement this function")
+    try:
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    except pd.errors.EmptyDataError:
+        return ExtractResult(
+            source_file=source_str,
+            is_empty=True,
+            fatal=False,
+        )
+    except (UnicodeDecodeError, pd.errors.ParserError, OSError) as exc:
+        return ExtractResult(
+            source_file=source_str,
+            error=str(exc),
+            error_kind=type(exc).__name__,
+            fatal=True,
+        )
+
+    columns = [str(col) for col in df.columns]
+    row_count = int(len(df))
+
+    if row_count == 0:
+        return ExtractResult(
+            source_file=source_str,
+            frame=df,
+            row_count=0,
+            columns=columns,
+            is_empty=True,
+            fatal=False,
+        )
+
+    return ExtractResult(
+        source_file=source_str,
+        frame=df,
+        row_count=row_count,
+        columns=columns,
+        is_empty=False,
+        fatal=False,
+    )
